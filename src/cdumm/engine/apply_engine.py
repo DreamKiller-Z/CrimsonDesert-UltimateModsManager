@@ -340,6 +340,7 @@ def aggregate_json_mods_into_synthetic_patches(
                 if flat_idx not in disabled:
                     tagged = dict(c)
                     tagged["_source_mod_id"] = mod_id
+                    tagged["_target_file"] = game_file
                     filtered.append(tagged)
                 flat_idx += 1
             if not filtered:

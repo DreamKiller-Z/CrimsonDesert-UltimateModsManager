@@ -736,6 +736,11 @@ def _apply_byte_patches(data: bytearray, changes: list[dict],
         # results back to a specific mod card for the post-apply badge.
         if "_source_mod_id" in change:
             entry["_source_mod_id"] = change["_source_mod_id"]
+        # Same trick for the target game file so persist_skip_summary's
+        # tooltip 'file' column can name the asset that failed (e.g.
+        # iteminfo.pabgb) instead of leaving it blank.
+        if "_target_file" in change:
+            entry["_target_file"] = change["_target_file"]
         skipped_out.append(entry)
     mismatched = 0
     relocated = 0

@@ -216,9 +216,11 @@ def expand_format3_into_aggregated(
         # back to this mod and persist_skip_summary writes a row that
         # lights up the yellow SKIPPED badge. Without this tag, skips
         # land anonymous and the badge stays dark for the entire
-        # Format 3 ecosystem.
+        # Format 3 ecosystem. Target file goes alongside so the badge
+        # tooltip's 'file' column names the asset that failed.
         for c in changes:
             c["_source_mod_id"] = mod_id
+            c["_target_file"] = target
         aggregated.setdefault(target, []).extend(changes)
         # Update summary counters for the apply-time log line.
         n_mods_changed += 1
