@@ -238,6 +238,54 @@ def _make_badge(text: str, bg: str = "#2878D0", fg: str = "#FFFFFF") -> QLabel:
 
 
 # ======================================================================
+# Resize handle (Task 2.1)
+# ======================================================================
+
+class _ResizeHandle(QWidget):
+    """A 4-pixel-wide invisible drag handle on the panel's right edge.
+
+    On press, snapshots the panel's current width and the global mouse
+    X. On move, computes ``new_width = start_width + (cursor_dx)``.
+    Because the panel is anchored on the RIGHT side of the main window
+    (it grows leftward as width increases), dragging RIGHT shrinks the
+    panel and dragging LEFT grows it from the user's perspective. We
+    flip the delta sign so the gesture matches user intuition: drag
+    LEFT to make the panel wider, drag RIGHT to shrink it.
+    """
+
+    def __init__(self, parent_panel) -> None:
+        super().__init__(parent_panel)
+        self._panel = parent_panel
+        self._drag_start_x: float | None = None
+        self._drag_start_width: int | None = None
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setFixedWidth(4)
+        # Transparent — no visual chrome, just a hot zone for the cursor.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+    def mousePressEvent(self, e):  # noqa: N802
+        self._drag_start_x = e.globalPosition().x()
+        self._drag_start_width = self._panel.width()
+        e.accept()
+
+    def mouseMoveEvent(self, e):  # noqa: N802
+        if self._drag_start_x is None or self._drag_start_width is None:
+            return
+        # Cursor delta in screen coords. Panel is right-anchored, so
+        # invert: dragging the handle LEFT (negative dx) widens the
+        # panel.
+        dx = e.globalPosition().x() - self._drag_start_x
+        new_width = int(self._drag_start_width - dx)
+        self._panel.set_panel_width(new_width)
+        e.accept()
+
+    def mouseReleaseEvent(self, e):  # noqa: N802
+        self._drag_start_x = None
+        self._drag_start_width = None
+        e.accept()
+
+
+# ======================================================================
 # ConfigPanel
 # ======================================================================
 
@@ -260,11 +308,23 @@ class ConfigPanel(QWidget):
     # ships option names with the full file path — both cases hit
     # the ellipsis at 520px even though wordWrap=True is set on the
     # label. Nexus reports: Malowded + AsteiosSaber 2026-05-05.
-    _PANEL_WIDTH = 640
+    _DEFAULT_PANEL_WIDTH = 640
+    _MIN_PANEL_WIDTH = 480
+    _MAX_PANEL_WIDTH = 1200
+    # Class-level fallback so any pre-__init__ access (or subclass that
+    # forgets to chain super) still finds a sane default. Instances
+    # shadow this with their own _PANEL_WIDTH set in __init__ so the
+    # drag handle can mutate it per-panel without touching the class.
+    _PANEL_WIDTH = _DEFAULT_PANEL_WIDTH
     _ANIM_DURATION = 250
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        # Per-instance width — Task 2.1 made this user-resizable via the
+        # drag handle on the right edge. Class-level _PANEL_WIDTH stays
+        # as a fallback default but the instance attr is what the
+        # animation and handle read/write.
+        self._PANEL_WIDTH = self._DEFAULT_PANEL_WIDTH
         self.setMaximumWidth(0)
         self.setMinimumWidth(0)
         self.setVisible(False)
@@ -298,6 +358,14 @@ class ConfigPanel(QWidget):
 
         self._build_ui()
         self._apply_theme()
+
+        # Drag handle on the right edge for user-resizable width. Created
+        # AFTER _build_ui so it sits on top of the scroll area's right
+        # margin. resizeEvent below repositions it whenever the panel
+        # resizes (animation, parent layout, manual setMaximumWidth).
+        self._resize_handle = _ResizeHandle(self)
+        self._resize_handle.raise_()
+        self._resize_handle.show()
 
         # Theme flip: collapsible section headers bake isDarkTheme()
         # into their stylesheet at build time, so the arrows and text
@@ -540,6 +608,48 @@ class ConfigPanel(QWidget):
         if self.maximumWidth() == 0:
             self.setVisible(False)
             self.panel_closed.emit()
+
+    # ------------------------------------------------------------------
+    # User-resizable width (Task 2.1)
+    # ------------------------------------------------------------------
+
+    def set_panel_width(self, width: int) -> None:
+        """Set the panel's target width, clamped to [MIN, MAX].
+
+        Updates the instance ``_PANEL_WIDTH`` so subsequent open
+        animations land at the new width, and — when the panel is
+        currently visible (maximumWidth > 0) — applies the new width
+        immediately via ``setMaximumWidth`` so the drag feels live.
+        Task 2.2 will persist the value; this method is the pure
+        widget-side write.
+        """
+        clamped = max(self._MIN_PANEL_WIDTH,
+                      min(self._MAX_PANEL_WIDTH, int(width)))
+        self._PANEL_WIDTH = clamped
+        # Apply live whenever the panel is visible (i.e. show_mod has
+        # been called). The width animation runs on the same
+        # ``maximumWidth`` property, so a plain setMaximumWidth would
+        # be immediately overwritten by the next animation tick when
+        # the open tween is still in flight. Stop the animation before
+        # writing the new width — but ONLY when its target is non-zero
+        # (the close animation targets 0 and we don't want a mid-drag
+        # set to interfere with closing).
+        if self.isVisible():
+            anim = getattr(self, "_anim", None)
+            if (anim is not None
+                    and anim.state() == anim.State.Running
+                    and anim.endValue() not in (None, 0)):
+                anim.stop()
+            self.setMaximumWidth(clamped)
+
+    def resizeEvent(self, event):  # noqa: N802
+        """Reposition the right-edge drag handle on every resize."""
+        super().resizeEvent(event)
+        handle = getattr(self, "_resize_handle", None)
+        if handle is not None:
+            w = handle.width()
+            handle.setGeometry(self.width() - w, 0, w, self.height())
+            handle.raise_()
 
     def _apply_theme(self) -> None:
         dark = isDarkTheme()
