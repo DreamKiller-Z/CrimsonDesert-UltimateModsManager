@@ -78,7 +78,7 @@ def test_native_parser_walks_every_record_to_correct_boundary():
                if i + 1 < len(sorted_offs) else len(body))
         expected = end - off
         try:
-            actual = parse_record_at(body, off) - off
+            actual = parse_record_at(body, off, rec_end=end) - off
         except Exception as e:
             drifts.append((key, expected, -1))
             if len(drifts) <= 3:

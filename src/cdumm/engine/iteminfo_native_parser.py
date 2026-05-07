@@ -33,11 +33,21 @@ from typing import Any
 class _Reader:
     """Cursor-tracking binary reader over a single iteminfo body."""
 
-    __slots__ = ("data", "pos")
+    __slots__ = ("data", "pos", "rec_end")
 
-    def __init__(self, data: bytes, pos: int = 0) -> None:
+    def __init__(
+        self,
+        data: bytes,
+        pos: int = 0,
+        rec_end: int | None = None,
+    ) -> None:
         self.data = data
         self.pos = pos
+        # Optional upper bound for the current record. When known (from
+        # the .pabgh boundary walker), forward-walk fallbacks cap their
+        # scan range here so an empty-GVP record's needle search doesn't
+        # latch onto the next record's GVP.
+        self.rec_end = rec_end
 
     def u8(self) -> int:
         v = self.data[self.pos]
@@ -184,10 +194,18 @@ def parse_first_record_size(data: bytes) -> int:
     return r.pos
 
 
-def parse_record_at(data: bytes, offset: int) -> int:
+def parse_record_at(
+    data: bytes, offset: int, rec_end: int | None = None
+) -> int:
     """Parse one record starting at ``offset`` and return the cursor
-    position after the record. Test helper for boundary checks."""
-    r = _Reader(data, offset)
+    position after the record. Test helper for boundary checks.
+
+    When ``rec_end`` is provided (known from the .pabgh index), it is
+    threaded through the reader so forward-walk fallbacks cap their
+    needle search at the record boundary instead of latching onto the
+    next record's GVP entry.
+    """
+    r = _Reader(data, offset, rec_end=rec_end)
     _read_item(r)
     return r.pos
 
@@ -721,6 +739,10 @@ def _read_PrefabDataTribe(r: _Reader, elem_index: int = 0, total_count: int = 1)
                     nearby = -1
                     sp = r.pos
                     se = min(r.pos + 1500, len(r.data))
+                    if r.rec_end is not None:
+                        bounded = r.rec_end - 40
+                        if bounded < se:
+                            se = bounded
                     while True:
                         cand = _find_gvp_needle(r.data, sp, se)
                         if cand < 0:
@@ -794,6 +816,10 @@ def _read_PrefabDataTribe(r: _Reader, elem_index: int = 0, total_count: int = 1)
                     nearby = -1
                     sp = r.pos
                     se = min(r.pos + 1500, len(r.data))
+                    if r.rec_end is not None:
+                        bounded = r.rec_end - 40
+                        if bounded < se:
+                            se = bounded
                     while True:
                         cand = _find_gvp_needle(r.data, sp, se)
                         if cand < 0:
@@ -886,6 +912,16 @@ def _shapeA2_forward_walk(r: _Reader) -> dict | None:
     # latching onto the GVP of the NEXT record's PrefabData entry, which
     # would push parser cursor beyond the current record boundary).
     scan_end = min(snap + 1500, len(r.data))
+    # When the record's true end is known (threaded in from the .pabgh
+    # boundary walker), cap scan_end at rec_end minus a safety margin
+    # for the downstream fixed-size fields (price_list count u32 +
+    # docking_child_data optional flag + a few more u8/u32 trailers).
+    # Without this cap, an empty-GVP record would have no needle in its
+    # own range and the scan would latch onto the next record's GVP.
+    if r.rec_end is not None:
+        bounded = r.rec_end - 40
+        if bounded < scan_end:
+            scan_end = bounded
     # Find needle that also has a SANE GVP count (1-10) at -8 bytes,
     # to filter out false-positive needles inside tribe data.
     search_pos = snap
