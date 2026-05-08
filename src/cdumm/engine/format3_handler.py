@@ -111,12 +111,21 @@ def _raw_field_metadata(table_name: str, field_name: str) -> dict | None:
 
 @dataclass(frozen=True)
 class Format3Intent:
-    """A single semantic intent from a Format 3 mod."""
+    """A single semantic intent from a Format 3 mod.
+
+    ``old`` is optional and only set for raw-record replacements
+    (``_buff_data_raw`` style intents): when both ``old`` and ``new``
+    are hex strings, the apply path searches the entry's payload
+    for ``old`` bytes and replaces them with ``new``. For regular
+    primitive / list intents ``old`` stays None and ``new`` is the
+    typed value to set.
+    """
     entry: str
     key: int
     field: str
     op: str
     new: Any
+    old: str | None = None
 
 
 @dataclass
@@ -199,12 +208,25 @@ def _parse_intents_block(
                 f"{label} intent #{i} has non-integer key "
                 f"{raw_key!r}, key must be an integer record id"
             )
+        # ``old`` is optional and only present on raw-record
+        # replacement intents (e.g. _buff_data_raw on skill.pabgb).
+        # When present alongside ``new``, both must be hex strings
+        # of equal length; the apply path treats them as a literal
+        # byte search-and-replace within the entry's payload.
+        raw_old = raw.get("old")
+        if raw_old is not None and not isinstance(raw_old, str):
+            raise ValueError(
+                f"{label} intent #{i} has non-string 'old' "
+                f"({type(raw_old).__name__}); 'old' must be a hex "
+                f"string when present"
+            )
         intents.append(Format3Intent(
             entry=str(raw["entry"]),
             key=raw_key,
             field=str(raw["field"]),
             op=str(raw.get("op", "set")),
             new=raw["new"],
+            old=raw_old,
         ))
     return intents
 
@@ -353,24 +375,38 @@ def validate_intents(
     table_name = _table_name_from_target(target)
 
     if not has_schema(table_name):
-        # If every intent in this batch has a registered list writer
-        # for this table, we don't actually need the PABGB schema.
-        # The list writer is the source of truth for the binary
-        # layout. Used for skill.pabgb where the schema isn't loaded
-        # but the vendored skill parser handles writes.
-        all_have_writer = bool(intents) and all(
-            (table_name, i.field) in LIST_WRITERS for i in intents
-        )
-        if all_have_writer:
+        # Three routes accept intents on a no-PABGB-schema table:
+        #   1. (table, field) in LIST_WRITERS — vendored writer handles
+        #      the binary layout (e.g. skill.pabgb _useResourceStatList).
+        #   2. field is in field_schema/<table>.json — community-curated
+        #      tid/offset/type entry, resolves the write position via
+        #      locate_field. Added 2026-05-08 to land voiddoiv's
+        #      skill.pabgb primitive contribution (Nexus comment).
+        #   3. intent has an ``old`` hex string alongside ``new`` —
+        #      raw-record byte replacement, anchored by searching for
+        #      ``old`` inside the entry's payload bounds. Used by
+        #      _buff_data_raw style intents on skill.pabgb where the
+        #      mod author ships the full vanilla + modded bytes.
+        fs_entries = load_field_schema(table_name)
+
+        def _routable(i: Format3Intent) -> bool:
+            return (
+                (table_name, i.field) in LIST_WRITERS
+                or i.field in fs_entries
+                or i.old is not None
+            )
+
+        if bool(intents) and all(_routable(i) for i in intents):
             for intent in intents:
                 result.supported.append(intent)
             return result
         reason = (
             f"target '{target}' has no schema in CDUMM "
-            f"(table '{table_name}' not in pabgb_complete_schema.json)"
+            f"(table '{table_name}' not in pabgb_complete_schema.json, "
+            f"and field not in field_schema/{table_name}.json)"
         )
         for intent in intents:
-            if (table_name, intent.field) in LIST_WRITERS:
+            if _routable(intent):
                 result.supported.append(intent)
             else:
                 result.skipped.append((intent, reason))

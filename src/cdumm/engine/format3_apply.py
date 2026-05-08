@@ -360,33 +360,199 @@ def _intents_to_v2_changes(
 
     has_cdumm_schema = has_schema(table_name)
     # Tables without a CDUMM PABGB schema are still processable when
-    # ALL their intents target a registered list writer (e.g. skill.pabgb
-    # via the vendored skillinfo_parser). The writer is the
-    # source of truth for the binary layout.
+    # intents route through either:
+    #   1. a registered list writer (e.g. skill.pabgb via the vendored
+    #      skillinfo_parser), or
+    #   2. a community-curated field_schema/<table>.json entry that
+    #      gives a tid/offset/type for primitive writes.
     if not has_cdumm_schema:
-        all_writer_routable = bool(intents) and all(
-            (table_name, i.field) in LIST_WRITERS for i in intents
-        )
-        if not all_writer_routable:
+        fs_entries_no_schema = load_field_schema(table_name)
+        list_routable = [
+            i for i in intents
+            if (table_name, i.field) in LIST_WRITERS
+        ]
+        fs_routable = [
+            i for i in intents
+            if (table_name, i.field) not in LIST_WRITERS
+            and i.field in fs_entries_no_schema
+            and i.old is None
+        ]
+        raw_routable = [
+            i for i in intents
+            if (table_name, i.field) not in LIST_WRITERS
+            and i.old is not None
+        ]
+        if not list_routable and not fs_routable and not raw_routable:
             return []
-        # Whole-table writer dispatch only — skip per-record path
-        # entirely. No need for PABGH parse, name index, etc.
         out: list[dict] = []
-        if table_name == "iteminfo":
-            from cdumm.engine.iteminfo_writer import (
-                build_iteminfo_intent_change,
-            )
-            change = build_iteminfo_intent_change(vanilla_body, list(intents))
-            if change is not None:
-                out.append(change)
-        elif table_name == "skill":
-            from cdumm.engine.skill_writer import (
-                build_skill_intent_change,
-            )
-            change = build_skill_intent_change(
-                vanilla_body, vanilla_header, list(intents))
-            if change is not None:
-                out.append(change)
+        # Whole-table writer dispatch for the list-routable batch.
+        if list_routable:
+            if table_name == "iteminfo":
+                from cdumm.engine.iteminfo_writer import (
+                    build_iteminfo_intent_change,
+                )
+                change = build_iteminfo_intent_change(
+                    vanilla_body, list(list_routable))
+                if change is not None:
+                    out.append(change)
+            elif table_name == "skill":
+                from cdumm.engine.skill_writer import (
+                    build_skill_intent_change,
+                )
+                change = build_skill_intent_change(
+                    vanilla_body, vanilla_header, list(list_routable))
+                if change is not None:
+                    out.append(change)
+        # Per-record field_schema dispatch for primitive intents on
+        # no-PABGB-schema tables. Mirrors the standard primitive path
+        # below but skips the PABGB schema walk entirely (we have a
+        # tid/offset directly from the community schema).
+        if fs_routable:
+            key_size_ns, offsets_ns = parse_pabgh_index(
+                vanilla_header, table_name)
+            if offsets_ns and key_size_ns in (2, 4):
+                sorted_ns = sorted(
+                    offsets_ns.items(), key=lambda kv: kv[1])
+                bounds_ns: dict[int, tuple[int, int, str]] = {}
+                for idx, (k, off) in enumerate(sorted_ns):
+                    end = (
+                        sorted_ns[idx + 1][1]
+                        if idx + 1 < len(sorted_ns)
+                        else len(vanilla_body)
+                    )
+                    name = _entry_name(vanilla_body, off, key_size_ns)
+                    bounds_ns[k] = (off, end, name)
+                for intent in fs_routable:
+                    if intent.key not in bounds_ns:
+                        continue
+                    entry_off_ns, entry_end_ns, entry_name_ns = (
+                        bounds_ns[intent.key])
+                    payload_off_ns = _payload_offset(
+                        vanilla_body, entry_off_ns, key_size_ns)
+                    if payload_off_ns is None:
+                        continue
+                    fs_entry = fs_entries_no_schema[intent.field]
+                    fmt_size = DTYPE_TABLE.get(
+                        fs_entry.data_type.lower())
+                    if fmt_size is None:
+                        continue
+                    fmt_ns, size_ns = fmt_size
+                    abs_off_ns = locate_field(
+                        vanilla_body, payload_off_ns,
+                        entry_end_ns, fs_entry)
+                    if abs_off_ns is None:
+                        continue
+                    if abs_off_ns + size_ns > entry_end_ns:
+                        continue
+                    try:
+                        new_bytes_ns = struct.pack(
+                            f"<{fmt_ns}", intent.new)
+                    except struct.error:
+                        continue
+                    if len(new_bytes_ns) != size_ns:
+                        continue
+                    original_ns = bytes(
+                        vanilla_body[abs_off_ns:abs_off_ns + size_ns])
+                    eid_size_ns = 2 if key_size_ns == 2 else 4
+                    name_len_ns = struct.unpack_from(
+                        "<I", vanilla_body,
+                        entry_off_ns + eid_size_ns)[0]
+                    name_end_ns = (
+                        entry_off_ns + eid_size_ns + 4 + name_len_ns)
+                    rel_offset_ns = abs_off_ns - name_end_ns
+                    out.append({
+                        "entry": entry_name_ns or intent.entry,
+                        "rel_offset": rel_offset_ns,
+                        "original": original_ns.hex(),
+                        "patched": new_bytes_ns.hex(),
+                        "label": f"{intent.entry}.{intent.field}",
+                    })
+        # Raw-record replacement: intent ships full old + new hex
+        # blobs and we search the entry's payload for an exact-once
+        # match of old. Used by _buff_data_raw style intents on
+        # skill.pabgb where the mod author exports the vanilla
+        # bytes alongside their modded bytes (voiddoiv contribution
+        # 2026-05-08).
+        if raw_routable:
+            key_size_rr, offsets_rr = parse_pabgh_index(
+                vanilla_header, table_name)
+            if offsets_rr and key_size_rr in (2, 4):
+                sorted_rr = sorted(
+                    offsets_rr.items(), key=lambda kv: kv[1])
+                bounds_rr: dict[int, tuple[int, int, str]] = {}
+                for idx, (k, off) in enumerate(sorted_rr):
+                    end = (
+                        sorted_rr[idx + 1][1]
+                        if idx + 1 < len(sorted_rr)
+                        else len(vanilla_body)
+                    )
+                    name = _entry_name(vanilla_body, off, key_size_rr)
+                    bounds_rr[k] = (off, end, name)
+                for intent in raw_routable:
+                    if intent.key not in bounds_rr:
+                        continue
+                    entry_off_rr, entry_end_rr, entry_name_rr = (
+                        bounds_rr[intent.key])
+                    try:
+                        old_bytes = bytes.fromhex(intent.old)
+                        new_bytes_rr = bytes.fromhex(str(intent.new))
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            "Format 3 raw intent for %s.%s on entry "
+                            "key=%d skipped: old/new are not valid "
+                            "hex strings",
+                            table_name, intent.field, intent.key)
+                        continue
+                    if not old_bytes or not new_bytes_rr:
+                        continue
+                    if len(old_bytes) != len(new_bytes_rr):
+                        logger.warning(
+                            "Format 3 raw intent for %s.%s on entry "
+                            "key=%d skipped: old (%d bytes) and new "
+                            "(%d bytes) must be equal length",
+                            table_name, intent.field, intent.key,
+                            len(old_bytes), len(new_bytes_rr))
+                        continue
+                    region = bytes(
+                        vanilla_body[entry_off_rr:entry_end_rr])
+                    first = region.find(old_bytes)
+                    if first == -1:
+                        logger.warning(
+                            "Format 3 raw intent for %s.%s on entry "
+                            "key=%d (%s) skipped: 'old' bytes not "
+                            "found in entry payload (mod expects "
+                            "different vanilla bytes than this game "
+                            "version ships)",
+                            table_name, intent.field, intent.key,
+                            entry_name_rr or intent.entry)
+                        continue
+                    second = region.find(old_bytes, first + 1)
+                    if second != -1:
+                        logger.warning(
+                            "Format 3 raw intent for %s.%s on entry "
+                            "key=%d (%s) skipped: 'old' bytes match "
+                            "at multiple positions (%d and %d) "
+                            "inside entry, refusing to guess which "
+                            "one to replace",
+                            table_name, intent.field, intent.key,
+                            entry_name_rr or intent.entry,
+                            first, second)
+                        continue
+                    abs_off_rr = entry_off_rr + first
+                    eid_size_rr = 2 if key_size_rr == 2 else 4
+                    name_len_rr = struct.unpack_from(
+                        "<I", vanilla_body,
+                        entry_off_rr + eid_size_rr)[0]
+                    name_end_rr = (
+                        entry_off_rr + eid_size_rr + 4 + name_len_rr)
+                    rel_offset_rr = abs_off_rr - name_end_rr
+                    out.append({
+                        "entry": entry_name_rr or intent.entry,
+                        "rel_offset": rel_offset_rr,
+                        "original": old_bytes.hex(),
+                        "patched": new_bytes_rr.hex(),
+                        "label": f"{intent.entry}.{intent.field}",
+                    })
         return out
 
     key_size, offsets = parse_pabgh_index(vanilla_header, table_name)

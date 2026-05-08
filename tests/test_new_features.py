@@ -149,10 +149,74 @@ def test_has_game_content_asi_only():
 
 # ── Feature 2: XML format fixup ──────────────────────────────────────
 
-def test_fix_xml_format():
+def test_fix_xml_format_passthrough_without_vanilla_reference():
+    """Without a vanilla reference, the function must not modify the
+    bytes. Older revisions unconditionally added a BOM and forced
+    CRLF; that broke mods whose authors shipped XMLs matching a
+    no-BOM mixed-line-ending vanilla shape. Confirmed 2026-05-08
+    against Enhanced Internal Graphics V2.8 (Nexus 651) which
+    crashed the game launch under CDUMM but not under DMM."""
     from cdumm.engine.crimson_browser_handler import fix_xml_format
     raw = b'<?xml version="1.0"?>\n<root>\n  <item/>\n</root>'
     fixed = fix_xml_format(raw)
-    assert fixed.startswith(b'\xef\xbb\xbf')  # UTF-8 BOM
-    assert b'<?xml' not in fixed  # declaration removed
-    assert b'\r\n' in fixed  # CRLF line endings
+    assert fixed == raw
+
+
+def test_fix_xml_format_matches_vanilla_no_bom():
+    """When vanilla has no BOM, the function must not add one even
+    if it would have under the old unconditional behavior. This
+    pins the regression that caused the Graphics Mod crash."""
+    from cdumm.engine.crimson_browser_handler import fix_xml_format
+    vanilla = b'\r\n<Root>\r\n<!-- vanilla, no BOM -->\r\n</Root>'
+    modded = b'\r\n<Root>\r\n<!-- modded, no BOM -->\r\n</Root>'
+    fixed = fix_xml_format(modded, vanilla)
+    assert not fixed.startswith(b'\xef\xbb\xbf'), (
+        "fix_xml_format added a BOM even though vanilla had none")
+    assert fixed == modded
+
+
+def test_fix_xml_format_adds_bom_when_vanilla_has_one():
+    """When vanilla starts with a UTF-8 BOM, a modded file without a
+    BOM must get one added."""
+    from cdumm.engine.crimson_browser_handler import fix_xml_format
+    vanilla = b'\xef\xbb\xbf<Root></Root>'
+    modded = b'<Root></Root>'
+    fixed = fix_xml_format(modded, vanilla)
+    assert fixed.startswith(b'\xef\xbb\xbf')
+    assert fixed == b'\xef\xbb\xbf<Root></Root>'
+
+
+def test_fix_xml_format_strips_bom_when_vanilla_has_none():
+    """When vanilla has no BOM but modded does, strip it."""
+    from cdumm.engine.crimson_browser_handler import fix_xml_format
+    vanilla = b'<Root></Root>'
+    modded = b'\xef\xbb\xbf<Root></Root>'
+    fixed = fix_xml_format(modded, vanilla)
+    assert not fixed.startswith(b'\xef\xbb\xbf')
+    assert fixed == b'<Root></Root>'
+
+
+def test_fix_xml_format_preserves_mixed_line_endings():
+    """Vanilla largescaleplacementinfo.xml has mixed CRLF + LF line
+    endings. The function must not normalize endings to a uniform
+    style — that would diverge from vanilla and the engine's parser
+    rejects it."""
+    from cdumm.engine.crimson_browser_handler import fix_xml_format
+    vanilla = b'\r\n<Root>\r\n<!-- a -->\n<!-- b -->\r\n</Root>'
+    modded = b'\r\n<Root>\r\n<!-- aa -->\n<!-- bb -->\r\n</Root>'
+    fixed = fix_xml_format(modded, vanilla)
+    # Mixed endings preserved exactly as in modded source
+    assert b'\r\n<!-- aa -->\n<!-- bb -->\r\n' in fixed
+    assert fixed == modded
+
+
+def test_fix_xml_format_strips_declaration_only_when_vanilla_has_none():
+    """If vanilla has no <?xml ...?> declaration, strip it from the
+    modded file. (Crimson Desert vanilla XMLs observed so far ship
+    no declaration.)"""
+    from cdumm.engine.crimson_browser_handler import fix_xml_format
+    vanilla = b'\xef\xbb\xbf<Root></Root>'
+    modded = b'\xef\xbb\xbf<?xml version="1.0"?>\n<Root></Root>'
+    fixed = fix_xml_format(modded, vanilla)
+    assert b'<?xml' not in fixed
+    assert fixed.startswith(b'\xef\xbb\xbf')

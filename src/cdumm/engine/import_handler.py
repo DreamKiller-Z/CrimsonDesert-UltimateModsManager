@@ -716,8 +716,35 @@ def _import_og_xml_as_mod(
     try:
         for og, entry in resolved:
             xml_bytes = og["source_path"].read_bytes()
+            # Match the modded XML's shape to vanilla so the engine's
+            # parser accepts it. Read vanilla bytes from the backup
+            # PAZ when available, else the live game PAZ. See
+            # ``fix_xml_format`` docstring for why per-entry vanilla
+            # is needed (different vanilla XMLs use different shapes).
             try:
-                xml_bytes = fix_xml_format(xml_bytes)
+                from cdumm.engine.cdmods_paths import get_cdmods_root
+                from cdumm.engine.json_patch_handler import (
+                    _extract_from_paz,
+                )
+                live_paz = Path(getattr(entry, "paz_file", "") or "")
+                vanilla_xml_bytes: bytes | None = None
+                if live_paz.exists():
+                    dir_name = live_paz.parent.name
+                    vanilla_paz_path = (
+                        get_cdmods_root(None, game_dir)
+                        / "vanilla" / dir_name / live_paz.name
+                    )
+                    vanilla_source = (
+                        vanilla_paz_path
+                        if vanilla_paz_path.exists()
+                        else live_paz
+                    )
+                    try:
+                        vanilla_xml_bytes = _extract_from_paz(
+                            entry, paz_path=str(vanilla_source))
+                    except Exception:
+                        vanilla_xml_bytes = None
+                xml_bytes = fix_xml_format(xml_bytes, vanilla_xml_bytes)
             except Exception:
                 pass
             # Per-mod subdir prevents cross-mod silent overwrite. Per-target

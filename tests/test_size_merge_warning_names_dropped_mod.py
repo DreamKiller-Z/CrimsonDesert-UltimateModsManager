@@ -62,8 +62,11 @@ def test_merge_warning_uses_mod_names_from_metadata():
 
     assert captured, "Expected a size-merge warning to fire"
     msg = captured[0]
-    # The warning must name BOTH the active and dropped mod by their
-    # real names. v3.2.6's bug regression would produce "mod #0".
+    # The warning must name the DROPPED mod by its real name so the
+    # user knows which mod is currently inactive. v3.2.6's regression
+    # would produce "mod #0". The new (post-2026-05-08) banner is
+    # plain English and does NOT mention the internal "aggregated
+    # JSON" winner label, since that name is meaningless to users.
     assert "mod #0" not in msg, (
         f"Warning still uses placeholder 'mod #0' instead of mod_name. "
         f"Full message: {msg!r}"
@@ -72,8 +75,16 @@ def test_merge_warning_uses_mod_names_from_metadata():
     assert "DerBambusbjoern's Loot Mod" in msg, (
         f"Dropped mod name missing from warning: {msg!r}"
     )
-    assert "aggregated JSON" in msg, (
-        f"Active mod name missing from warning: {msg!r}"
+    # No technical phrasing leaks into the user-visible banner.
+    for jargon in ("file size", "inserts", "byte-merge",
+                   "byte-level", "aggregated JSON"):
+        assert jargon not in msg, (
+            f"Banner still contains technical phrasing {jargon!r}: "
+            f"{msg!r}"
+        )
+    # Affected file path is shown for users who want to dig in.
+    assert "gamedata/dropsetinfo.pabgb" in msg, (
+        f"Affected file path missing from warning: {msg!r}"
     )
 
 

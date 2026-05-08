@@ -208,11 +208,56 @@ class ConflictView(QWidget):
                          auto_expand: bool = True) -> None:
         """Rebuild the tree with the current conflict list.
 
-        ``auto_expand`` controls whether pair rows are expanded by default.
-        The conflicts dialog passes False so compact pair rows are shown;
-        the user opens the pair manually to see child file rows. Other
-        callers keep auto-expansion for quick scanning of short lists.
+        ``auto_expand`` controls whether pair rows are expanded by default
+        on FIRST population. Once the user has manually expanded/collapsed
+        rows, subsequent rebuilds preserve those choices instead of
+        re-running auto-expand (which would visibly snap rows back to the
+        default). Bug: previously every rebuild called
+        ``self._model.removeRows(...)`` then ``self._tree.expandAll()``
+        when auto_expand=True, which wiped the user's expansion state,
+        scroll position, and selection on every refresh — typing in the
+        mod list, toggling a mod, or clicking Apply made the tree jump
+        back to the top with all groups reset.
         """
+        # Capture state to restore after rebuild.
+        prev_expanded_pairs: set[tuple[int, int]] = set()
+        prev_expanded_files: set[tuple[int, int, str]] = set()
+        for row in range(self._model.rowCount()):
+            pair_item = self._model.item(row, 0)
+            if pair_item is None:
+                continue
+            mod_a = pair_item.data(MOD_A_ID_ROLE)
+            mod_b = pair_item.data(MOD_B_ID_ROLE)
+            if mod_a is None or mod_b is None:
+                continue
+            pair_key = (mod_a, mod_b)
+            if self._tree.isExpanded(self._model.indexFromItem(pair_item)):
+                prev_expanded_pairs.add(pair_key)
+            for child_row in range(pair_item.rowCount()):
+                child = pair_item.child(child_row, 0)
+                if child is None:
+                    continue
+                fp = child.text() or ""
+                child_idx = self._model.indexFromItem(child)
+                if self._tree.isExpanded(child_idx):
+                    prev_expanded_files.add((mod_a, mod_b, fp))
+        prev_scroll_v = self._tree.verticalScrollBar().value()
+        prev_scroll_h = self._tree.horizontalScrollBar().value()
+        had_prior_data = self._model.rowCount() > 0
+        # Selection / current index, by stable identity rather than row.
+        sel_pair_key: tuple[int, int] | None = None
+        sel_file_path: str | None = None
+        cur_idx = self._tree.currentIndex()
+        if cur_idx.isValid():
+            cur_item = self._model.itemFromIndex(cur_idx.siblingAtColumn(0))
+            if cur_item is not None:
+                a = cur_item.data(MOD_A_ID_ROLE)
+                b = cur_item.data(MOD_B_ID_ROLE)
+                if a is not None and b is not None:
+                    sel_pair_key = (a, b)
+                    if cur_item.parent() is not None:
+                        sel_file_path = cur_item.text() or ""
+
         self._tree.setUpdatesEnabled(False)
         self._model.blockSignals(True)
         self._model.removeRows(0, self._model.rowCount())
@@ -227,6 +272,12 @@ class ConflictView(QWidget):
             empty = QStandardItem(tr("conflicts.empty_title"))
             empty.setForeground(QColor("#4CAF50"))
             self._model.appendRow([empty, QStandardItem(""), QStandardItem("")])
+            # Re-enable updates / signals before bailing — otherwise the
+            # tree stays frozen for the rest of the dialog's lifetime
+            # if no conflicts ever populate. Latent bug from before
+            # state-preservation refactor.
+            self._model.blockSignals(False)
+            self._tree.setUpdatesEnabled(True)
             return
 
         # Group by mod pair
@@ -294,9 +345,55 @@ class ConflictView(QWidget):
 
         self._model.blockSignals(False)
         self._model.layoutChanged.emit()
+        # Restore expansion state from before the rebuild. Pairs and
+        # children that didn't exist before stay collapsed by default.
+        # auto_expand only fires on the FIRST population (no prior data
+        # to preserve) so the convenience-expand-all behaviour still
+        # works for fresh dialogs but doesn't fight the user's choices
+        # on subsequent refreshes.
+        new_pair_keys: set[tuple[int, int]] = set()
+        for row in range(self._model.rowCount()):
+            pair_item = self._model.item(row, 0)
+            if pair_item is None:
+                continue
+            mod_a = pair_item.data(MOD_A_ID_ROLE)
+            mod_b = pair_item.data(MOD_B_ID_ROLE)
+            if mod_a is None or mod_b is None:
+                continue
+            pair_key = (mod_a, mod_b)
+            new_pair_keys.add(pair_key)
+            should_expand_pair = (
+                pair_key in prev_expanded_pairs
+                or (auto_expand and not had_prior_data
+                    and len(conflicts) <= 50)
+            )
+            if should_expand_pair:
+                self._tree.expand(self._model.indexFromItem(pair_item))
+            for child_row in range(pair_item.rowCount()):
+                child = pair_item.child(child_row, 0)
+                if child is None:
+                    continue
+                fp = child.text() or ""
+                if (mod_a, mod_b, fp) in prev_expanded_files:
+                    self._tree.expand(self._model.indexFromItem(child))
+            # Re-select the previously-current pair / file, if it still
+            # exists after the rebuild.
+            if pair_key == sel_pair_key:
+                target = pair_item
+                if sel_file_path is not None:
+                    for child_row in range(pair_item.rowCount()):
+                        child = pair_item.child(child_row, 0)
+                        if (child is not None
+                                and child.text() == sel_file_path):
+                            target = child
+                            break
+                self._tree.setCurrentIndex(
+                    self._model.indexFromItem(target))
         self._tree.setUpdatesEnabled(True)
-        if auto_expand and len(conflicts) <= 50:
-            self._tree.expandAll()
+        # Restore scroll position last so it survives layout settling
+        # from expand() calls above.
+        self._tree.verticalScrollBar().setValue(prev_scroll_v)
+        self._tree.horizontalScrollBar().setValue(prev_scroll_h)
 
     def _show_context_menu(self, pos) -> None:
         """Show right-click menu with Set Winner options."""

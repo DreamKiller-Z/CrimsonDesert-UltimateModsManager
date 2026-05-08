@@ -2751,11 +2751,56 @@ class ApplyWorker(QObject):
             else:
                 size_preserving.append(d)
 
-        # Step 1: Apply full-replace deltas (last one wins if multiple)
-        for d in full_replace:
-            current = apply_delta_from_file(current, Path(d["delta_path"]))
-            logger.info("Applied full-replace delta for %s from %s",
-                        file_path, d.get("mod_name", "?"))
+        # Step 1: Apply ONE full-replace delta (the priority winner).
+        # When multiple mods ship a full-replace bsdiff for the same
+        # .paz, each bsdiff was computed against vanilla. Applying
+        # them sequentially feeds the second bsdiff a non-vanilla
+        # input (the first mod's output), which produces a corrupted
+        # paz: the bsdiff control stream issues copies/inserts that
+        # don't reconcile with the actual base bytes, the result is
+        # truncated or scrambled, and PAMT entries point past the
+        # end of the file → game crashes on launch.
+        # Bug confirmed 2026-05-08 against Graphics Mod (Nexus 651)
+        # + Vaxis Water Physics Overhaul Mod (Nexus 2376) both
+        # full-replacing 0003/0.paz: the staged paz was 756563 bytes
+        # but PAMT expected 816735, the trailing renderpass entries
+        # all failed LZ4 decompression with "expected another byte,
+        # found none" or "offset to copy not contained in
+        # decompressed buffer".
+        # Sort by priority so the highest-priority mod wins
+        # deterministically. Lower priority value wins in CDUMM.
+        if full_replace:
+            full_replace_sorted = sorted(
+                full_replace,
+                key=lambda d: d.get("priority", 0))
+            winner = full_replace_sorted[0]
+            current = apply_delta_from_file(
+                current, Path(winner["delta_path"]))
+            logger.info(
+                "Applied full-replace delta for %s from %s",
+                file_path, winner.get("mod_name", "?"))
+            if len(full_replace_sorted) > 1:
+                skipped = [
+                    d.get("mod_name", "?")
+                    for d in full_replace_sorted[1:]
+                ]
+                msg = (
+                    f"Skipped conflicting full-replace delta(s) for "
+                    f"'{file_path}' from: {', '.join(skipped)}. "
+                    f"Each mod ships a complete replacement of this "
+                    f"file, so CDUMM cannot combine them. Kept: "
+                    f"'{winner.get('mod_name', '?')}' (highest "
+                    f"priority). To use a skipped mod instead, raise "
+                    f"its priority above the kept one in your mod "
+                    f"list."
+                )
+                logger.warning(msg)
+                if hasattr(self, "_soft_warnings"):
+                    self._soft_warnings.append(msg)
+                try:
+                    self.warning.emit(msg)
+                except Exception:
+                    pass
 
         # Step 2: Apply SPRS deltas that shift file size
         for d in sprs_shifted:
@@ -2964,8 +3009,57 @@ class ApplyWorker(QObject):
                 if vanilla_for_bytes and mod_bodies and len(mod_bodies) >= 2:
                     from cdumm.engine.compiled_merge import merge_compiled_mod_files
                     ordered = list(mod_bodies.items())  # priority order preserved
-                    merged_body, warnings = merge_compiled_mod_files(
-                        vanilla_for_bytes, ordered)
+                    # merge_compiled_mod_files always emits a buffer
+                    # the same length as vanilla and silently drops
+                    # bytes past that length. If any mod grew or
+                    # shrank the body (inserts of new XML elements,
+                    # added attributes, etc.), three-way byte-merge
+                    # would truncate the inserts mid-token, producing
+                    # malformed XML/CSS/HTML that the engine accepts
+                    # at parse but renders unusable. Fall back to the
+                    # priority-winning mod's full body when ANY
+                    # contributor changes the file size, mirroring the
+                    # guard in _merge_same_target_overlay_entries.
+                    # Bug confirmed 2026-05-08 against Faster
+                    # Interactions All RAW (Nexus 146): the mod adds
+                    # 789 bytes to ui/inputmap_common.xml; when stacked
+                    # with Better Radial Menus + No Intro the byte-
+                    # merge truncated those bytes, the resulting
+                    # inputmap loaded but no input action dispatched,
+                    # the user could not even ALT+F4 out of the game.
+                    size_changed = [
+                        (n, len(body)) for n, body in ordered
+                        if len(body) != len(vanilla_for_bytes)
+                    ]
+                    if size_changed:
+                        winner_name, winner_body = ordered[-1]
+                        size_summary = ", ".join(
+                            f"'{n}' ({sz} bytes)"
+                            for n, sz in size_changed
+                        )
+                        msg = (
+                            f"Some mods on '{entry_path}' change the "
+                            f"file size. CDUMM cannot byte-merge them "
+                            f"with the others without truncating the "
+                            f"new bytes mid-token. Kept: "
+                            f"'{winner_name}' (highest priority) at "
+                            f"its full size; merged none of the "
+                            f"others into it. Size-changing mods: "
+                            f"{size_summary}. To use a different "
+                            f"mod's version, raise its priority above "
+                            f"'{winner_name}' in your mod list."
+                        )
+                        logger.warning(msg)
+                        if hasattr(self, "_soft_warnings"):
+                            self._soft_warnings.append(msg)
+                        try:
+                            self.warning.emit(msg)
+                        except Exception:
+                            pass
+                        merged_body, warnings = winner_body, []
+                    else:
+                        merged_body, warnings = merge_compiled_mod_files(
+                            vanilla_for_bytes, ordered)
                     if warnings:
                         logger.info(
                             "byte-merge: %d byte-range overlap(s)",
@@ -3183,13 +3277,31 @@ class ApplyWorker(QObject):
                 names_block = ", ".join(f"'{n}'" for n in shown)
                 if more > 0:
                     names_block += f" and {more} more"
-                msg = (f"{len(dropped_names)} mod(s) targeting "
-                       f"'{entry_path}' were dropped because they change "
-                       f"the file size and can't merge with inserts. "
-                       f"Active: '{kept_name}'. "
-                       f"Dropped: {names_block}. "
-                       f"Drag a different mod to the top of the load "
-                       f"order to pick another winner.")
+                # Plain-English banner: lead with which mod is
+                # currently inactive and the action the user can take.
+                # Drop technical phrasing ("file size", "inserts",
+                # "byte-level merge", internal "aggregated JSON" label)
+                # in favor of one sentence + one action + an affected-
+                # file footnote for users who want to dig in.
+                if len(dropped_names) == 1:
+                    msg = (
+                        f"'{shown[0]}' could not be applied. Another "
+                        f"enabled mod is changing the same game data, "
+                        f"and the two mods cannot be combined. To use "
+                        f"'{shown[0]}' instead, move it higher in the "
+                        f"mod list than the other mod. "
+                        f"(File: {entry_path})"
+                    )
+                else:
+                    msg = (
+                        f"Some mods could not be applied: "
+                        f"{names_block}. Other enabled mods are "
+                        f"changing the same game data, and these mods "
+                        f"cannot be combined with them. To activate "
+                        f"one of these, move it higher in the mod "
+                        f"list than the other mods. "
+                        f"(File: {entry_path})"
+                    )
                 if hasattr(self, "_soft_warnings"):
                     self._soft_warnings.append(msg)
                 try:
