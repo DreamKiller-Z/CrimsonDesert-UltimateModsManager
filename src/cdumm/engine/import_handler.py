@@ -1358,12 +1358,73 @@ def _find_loose_file_candidates(path: Path, max_depth: int = 5) -> list[dict]:
     results: list[dict] = []
     seen_bases: set[str] = set()
 
-    def _check_candidate(candidate: Path) -> dict | None:
+    def _check_candidate(candidate: Path) -> dict | list[dict] | None:
         base_key = str(candidate)
         if base_key in seen_bases:
             return None
-        # Pattern 1: mod.json + files/
+        # Pattern 5: mod.json at this folder + 2+ sibling subfolders
+        # each carrying a NNNN/0.paz layout. Surface one candidate
+        # per sibling so the GUI's variant picker fires. Used by
+        # Character Creator (mod 837): CharacterCreator/mod.json
+        # alongside HumanFemale/0036/0.paz, GoblinMale/0036/0.paz,
+        # etc. Must run BEFORE Pattern 2 because Pattern 2 would
+        # otherwise match the top-level mod.json + sibling json/asi
+        # files at root and stop the walk before the body-type
+        # subfolders get a chance.
         mod_json = candidate / "mod.json"
+        if mod_json.exists():
+            try:
+                with open(mod_json, "r", encoding="utf-8") as f:
+                    _mj = json.load(f)
+                _modinfo = (
+                    _mj.get("modinfo")
+                    if isinstance(_mj, dict) else None) or {}
+            except Exception:  # noqa: BLE001
+                _modinfo = {}
+            variant_subdirs: list[Path] = []
+            try:
+                for sub in candidate.iterdir():
+                    if not sub.is_dir():
+                        continue
+                    # Skip directories that are part of a Pattern-1
+                    # or Pattern-2 layout (handled below) so we don't
+                    # mis-classify a single-mod with a plain "files/"
+                    # tree as a variant pack.
+                    if sub.name in ("files", "game_files", "meta",
+                                    "_asi_staging"):
+                        continue
+                    try:
+                        for d in sub.iterdir():
+                            if (d.is_dir()
+                                    and d.name.isdigit()
+                                    and len(d.name) == 4
+                                    and (d / "0.paz").exists()):
+                                variant_subdirs.append(sub)
+                                break
+                    except OSError:
+                        continue
+            except OSError:
+                variant_subdirs = []
+            if len(variant_subdirs) >= 2:
+                seen_bases.add(base_key)
+                _title = _modinfo.get("title", candidate.name)
+                results_list: list[dict] = []
+                for sub in variant_subdirs:
+                    seen_bases.add(str(sub))
+                    results_list.append({
+                        "format": "loose_file_mod",
+                        "id": sub.name,
+                        "files_dir": ".",
+                        "_manifest_path": mod_json,
+                        "_base_dir": sub,
+                        "_modinfo": {
+                            **_modinfo,
+                            "title": f"{_title} - {sub.name}",
+                            "variant_id": sub.name,
+                        },
+                    })
+                return results_list
+        # Pattern 1: mod.json + files/
         files_dir = candidate / "files"
         if mod_json.exists() and files_dir.exists():
             try:
@@ -1480,7 +1541,12 @@ def _find_loose_file_candidates(path: Path, max_depth: int = 5) -> list[dict]:
             return
         hit = _check_candidate(directory)
         if hit:
-            results.append(hit)
+            # Pattern 5 returns a list of variant candidates; the
+            # other patterns still return a single dict. Handle both.
+            if isinstance(hit, list):
+                results.extend(hit)
+            else:
+                results.append(hit)
             return  # don't recurse into a found mod root
         try:
             children = [d for d in directory.iterdir() if d.is_dir()
