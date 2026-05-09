@@ -197,6 +197,7 @@ from PySide6.QtWidgets import (
 
 from qfluentwidgets import (
     CaptionLabel,
+    FlowLayout,
     PrimaryPushButton,
     RadioButton,
     SingleDirectionScrollArea,
@@ -815,9 +816,21 @@ class ConfigPanel(QWidget):
         button_group.buttonClicked.connect(self._on_preset_selected)
         self._preset_radio_group = button_group
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 4, 0, 8)
-        row.setSpacing(12)
+        # FlowLayout instead of QHBoxLayout: when the row of radios
+        # fits on one line it behaves identically; when it can't (lots
+        # of preset tags, narrow panel width) it wraps to additional
+        # rows so every radio stays reachable. wootwoots reported on
+        # Nexus 2026-05-08 that mod 1103 (12 percent presets + Custom)
+        # had the rightmost radios clipped off the panel with no
+        # scroll, no wrap. Mod author's suggested workaround was a
+        # vertical stack like JMM; FlowLayout is the same idea but
+        # only wraps when actually needed.
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        flow = FlowLayout(container, needAni=False, isTight=True)
+        flow.setContentsMargins(0, 4, 0, 8)
+        flow.setHorizontalSpacing(12)
+        flow.setVerticalSpacing(6)
 
         match_tag = current_preset if current_preset in groups else None
         for tag in groups.keys():
@@ -825,7 +838,7 @@ class ConfigPanel(QWidget):
             if match_tag is not None and tag == match_tag:
                 rb.setChecked(True)
             button_group.addButton(rb)
-            row.addWidget(rb)
+            flow.addWidget(rb)
 
         custom_rb = RadioButton("Custom")
         # Custom is the default fallback when no current_preset matches
@@ -834,12 +847,8 @@ class ConfigPanel(QWidget):
         if match_tag is None:
             custom_rb.setChecked(True)
         button_group.addButton(custom_rb)
-        row.addWidget(custom_rb)
-        row.addStretch()
+        flow.addWidget(custom_rb)
 
-        container = QWidget()
-        container.setLayout(row)
-        container.setStyleSheet("background: transparent;")
         self._body_layout.addWidget(container)
 
     def _on_preset_selected(self, button) -> None:
