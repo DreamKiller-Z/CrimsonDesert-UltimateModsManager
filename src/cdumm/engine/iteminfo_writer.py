@@ -222,15 +222,29 @@ def build_iteminfo_intent_change(
         # `_isBlocked`.
         target_field = _resolve_field_name(intent.field, item)
         if target_field is None:
-            skipped_field += 1
-            logger.warning(
-                "iteminfo writer: field %r not in ItemInfo dict for "
-                "key=%d, skipping (likely a primitive name the writer "
-                "doesn't expose; per-record path would handle it but "
-                "this intent was force-batched into the whole-table "
-                "writer because another intent on iteminfo uses a "
-                "list-of-dict field)", intent.field, intent.key)
-            continue
+            # Field name is supported by the writer but the parsed
+            # ItemInfo dict for THIS specific key doesn't carry it
+            # (vanilla item has no enchants → `enchant_data_list` is
+            # absent from the parsed record). The intent wants to ADD
+            # the field, not overwrite. Bug 2026-05-10 (hhkbble #79):
+            # Oh_My_Thief.field.json adds enchant_data_list to Axiom
+            # Bracelet (key=1001129) which has no enchants in vanilla,
+            # so resolving the field name failed and the intent was
+            # silently dropped. Treat any SUPPORTED_FIELDS name as an
+            # additive key on the existing record.
+            if intent.field in SUPPORTED_FIELDS:
+                target_field = intent.field
+            else:
+                skipped_field += 1
+                logger.warning(
+                    "iteminfo writer: field %r not in ItemInfo dict "
+                    "for key=%d, skipping (likely a primitive name "
+                    "the writer doesn't expose; per-record path "
+                    "would handle it but this intent was force-"
+                    "batched into the whole-table writer because "
+                    "another intent on iteminfo uses a list-of-dict "
+                    "field)", intent.field, intent.key)
+                continue
         try:
             item[target_field] = intent.new
             applied += 1

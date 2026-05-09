@@ -3626,6 +3626,65 @@ class CdummWindow(FluentWindow):
                 dialog = PresetPickerDialog(presets, self)
                 if dialog.exec() and dialog.selected_presets:
                     selected = dialog.selected_presets
+                    # Auto-fire the patch-level Toggle picker for any
+                    # selected preset that has labeled changes (mod 356
+                    # Unlimited Dragon Flying ships 5 mutex Ride
+                    # Duration radios + 3 always-on toggles inside one
+                    # JSON). Without this, the user only sees the
+                    # mutex/checkbox UI later via Configure options on
+                    # the side panel — Faisal's UX feedback 2026-05-10.
+                    try:
+                        from cdumm.gui.preset_picker import (
+                            TogglePickerDialog,
+                            _detect_preset_groups,
+                            _detect_mutex_offset_groups)
+                    except ImportError:
+                        TogglePickerDialog = None
+                        _detect_preset_groups = lambda _d: None  # noqa: E731
+                        _detect_mutex_offset_groups = lambda _d: None  # noqa: E731
+
+                    def _has_meaningful_choice(d: dict) -> bool:
+                        # Only auto-fire when the JSON actually offers a
+                        # choice the user has to make: bracket-prefix
+                        # presets ([0%]/[25%]/...) or same-offset mutex
+                        # variants (Ride Duration 30/60/120 min). Skip
+                        # mods that just happen to have many labeled
+                        # changes (mod 356 Region Dismount Removal has
+                        # 456 plain region toggles — flooding the user
+                        # with 456 checkboxes at import is the opposite
+                        # of helpful; let those surface via the cog).
+                        return (_detect_preset_groups(d) is not None
+                                or _detect_mutex_offset_groups(d)
+                                is not None)
+                    refined: list[tuple] = []
+                    aborted = False
+                    for fp, data in selected:
+                        if (TogglePickerDialog is not None
+                                and _has_meaningful_choice(data)):
+                            tp = TogglePickerDialog(data, self)
+                            if tp.exec() and tp.selected_data:
+                                refined.append((fp, tp.selected_data))
+                            else:
+                                aborted = True
+                                break
+                        else:
+                            refined.append((fp, data))
+                    if aborted:
+                        if tmp_extract:
+                            import shutil
+                            shutil.rmtree(tmp_extract, ignore_errors=True)
+                        self._configurable_source = None
+                        self._process_next_import()
+                        return
+                    selected = refined
+                    # Propagate refined data into the parent `presets`
+                    # list so import_multi_variant — which receives the
+                    # FULL preset list, not just `selected` — sees the
+                    # user's per-patch picks for the ticked variants.
+                    refined_by_path = {fp: d for fp, d in refined}
+                    presets = [
+                        (fp, refined_by_path.get(fp, d))
+                        for fp, d in presets]
                     if len(selected) > 1:
                         # Multi-select → ONE mod row with ALL presets from
                         # the archive stored under variants/. Ticked presets
@@ -3985,6 +4044,71 @@ class CdummWindow(FluentWindow):
                             "will install after main import: %s",
                             len(_asi_files),
                             [a.name for a in _asi_files])
+                    # Pattern 5 wrapper companions (Character Creator
+                    # mod 837 ships FemaleAnimations.json alongside the
+                    # 6 body-type subfolders). Without queuing these as
+                    # separate imports, picking a body type drops the
+                    # JSON sibling on the floor — Democles85 #81 follow-
+                    # up. Only scan the wrapper level (parent of the
+                    # picked variant) so we don't pick up unrelated
+                    # JSONs from inside the body-type subfolders.
+                    try:
+                        from cdumm.engine.json_patch_handler import (
+                            detect_json_patch)
+                        _wrapper = _current.parent
+                        if (_wrapper != scan_dir
+                                and _wrapper.parent == scan_dir):
+                            for _sib in _wrapper.iterdir():
+                                if (not _sib.is_file()
+                                        or _sib.suffix.lower() != ".json"
+                                        or _sib.name == "mod.json"):
+                                    continue
+                                # Only queue real JSON patches, not
+                                # arbitrary config blobs.
+                                try:
+                                    if detect_json_patch(_sib) is None:
+                                        continue
+                                except Exception:
+                                    continue
+                                # Stage to a stable temp so the picker
+                                # tmp cleanup doesn't yank it before
+                                # the queued import runs.
+                                try:
+                                    import shutil as _sh
+                                    import tempfile as _tf
+                                    _stage = Path(_tf.mkdtemp(
+                                        prefix="cdumm_var_json_"))
+                                    _staged = _stage / _sib.name
+                                    _sh.copy2(_sib, _staged)
+                                    # Append to the queue WITHOUT
+                                    # triggering _process_next_import.
+                                    # If we let it auto-process, it
+                                    # would launch BEFORE the body-type
+                                    # import (no worker is running yet)
+                                    # and steal the variant_leaf_rel
+                                    # context, leaving the body-type
+                                    # mod unnamed. The body-type's own
+                                    # _launch path runs further down
+                                    # this same flow; the queued
+                                    # companion will pick up after it.
+                                    if not hasattr(
+                                            self, "_import_queue"):
+                                        self._import_queue = []
+                                    self._import_queue.append(_staged)
+                                    logger.info(
+                                        "Variant pack: queued companion "
+                                        "JSON %s for separate import "
+                                        "(queue size: %d)",
+                                        _sib.name,
+                                        len(self._import_queue))
+                                except Exception as _je:
+                                    logger.debug(
+                                        "Companion JSON queue failed "
+                                        "(%s): %s", _sib.name, _je)
+                    except Exception as _e:
+                        logger.debug(
+                            "Variant companion-JSON scan failed: %s",
+                            _e)
                     path = _current
                     # Variant picker fired and `_current` lives inside the
                     # pre-extract temp dir. Schedule the temp for cleanup
@@ -4109,7 +4233,8 @@ class CdummWindow(FluentWindow):
         # ── 6. Toggle picker ──────────────────────────────────────────
         try:
             from cdumm.engine.json_patch_handler import (
-                detect_json_patch, detect_json_patches_all, has_labeled_changes)
+                detect_json_patch, detect_json_patches_all)
+            from cdumm.gui.preset_picker import has_labeled_changes
             json_data = None
             if path.suffix.lower() == '.json':
                 json_data = detect_json_patch(path)

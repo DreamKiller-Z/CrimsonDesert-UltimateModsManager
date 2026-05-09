@@ -134,24 +134,45 @@ def _flatten_folder_variants(root, max_depth: int = 4):
     normalized to "/".
     """
     from cdumm.gui.preset_picker import find_folder_variants
+    from cdumm.engine.import_handler import find_loose_file_variants
     results: list[tuple] = []
 
-    def walk(path, depth: int):
+    def walk(path, depth: int, rel_root):
         if depth > max_depth:
             return
         children = find_folder_variants(path)
-        if len(children) < 2:
-            # Leaf: the path itself IS one variant (or not a variant at
-            # all). Caller handled the "0 variants" case before calling
-            # us, so we only emit when path != root.
-            if path != root:
-                rel = path.relative_to(root).as_posix()
-                results.append((path, rel))
+        if len(children) >= 2:
+            for child in children:
+                walk(child, depth + 1, rel_root)
             return
-        for child in children:
-            walk(child, depth + 1)
+        # Pattern 5 packs (Character Creator mod 837): mod.json wrapper
+        # plus N sibling subfolders each carrying NNNN/0.paz. The legacy
+        # find_folder_variants only sees the wrapper, so the cog side
+        # panel showed empty. Fall back to the loose-file variant
+        # detector so the same body-type radios surface as in the
+        # import-time picker. Re-root rel paths at the wrapper folder so
+        # the grid axis doesn't get a useless single-option level for
+        # the wrapper name.
+        try:
+            loose = find_loose_file_variants(path)
+        except Exception:
+            loose = []
+        if len(loose) >= 2:
+            # Re-root at the wrapper (each loose variant's parent dir)
+            # so the rel path is just the body-type name, not
+            # "CharacterCreator/HumanFemale".
+            for v in loose:
+                child = v["_base_dir"]
+                walk(child, depth + 1, child.parent)
+            return
+        # Leaf: the path itself IS one variant (or not a variant at
+        # all). Caller handled the "0 variants" case before calling
+        # us, so we only emit when path != root.
+        if path != root:
+            rel = path.relative_to(rel_root).as_posix()
+            results.append((path, rel))
 
-    walk(root, 0)
+    walk(root, 0, root)
     return results
 
 

@@ -18,6 +18,15 @@ _UNRELEASED_NOTES: list[str] = []
 
 CHANGELOG = [
     {
+        "version": "3.2.16",
+        "date": "2026-05-10",
+        "notes": [
+            "<b>Variant packs that wrap multiple body-type folders under one mod.json now show a picker at import.</b> Some authors ship a mod with a top-level mod.json plus several sibling subfolders, each holding its own NNNN/0.paz archive (Character Creator on Nexus puts HumanFemale, HumanMale, GoblinFemale, GoblinMale, OrcFemale, OrcMale next to one mod.json and one shared FemaleAnimations.json). CDUMM only saw the wrapper before and silently picked one of the body types alphabetically, so the user could not actually choose. The variant picker now fires for these layouts the same way it does for any other multi-variant pack, the picked body type imports as a Character Creator card, and the FemaleAnimations.json sibling lands as its own separate mod card alongside it. The cog on the Character Creator card opens the side panel with a radio row for the six body types so you can swap to a different body type later without re-dropping the zip. Thanks to Democles85 (GitHub #81).",
+            "<b>The configuration panel surfaces the same preset choice at import time, not only after the fact.</b> Mods that ship multiple labelled changes at the same byte offset (Zowbaid's Unlimited Dragon Flying packs five Ride Duration variants at one offset alongside Cooldown, HP Regen, and Stamina toggles) used to import with all options in some default state. You had to open the cog and click Configure options to actually pick a Ride Duration. Now the patch-level picker fires at drop time, you choose Ride Duration up front, and the always-on toggles stay independent so picking a Ride Duration radio does not unselect Cooldown or HP Regen.",
+            "<b>Format 3 iteminfo intents that add a list field to a record without one in vanilla now apply.</b> A common pattern is a mod that adds enchant_data_list to an item that has no enchants in vanilla. The writer was looking up the field in the parsed record dict, finding nothing because the record has no enchant_data_list key in the first place, and skipping the intent with a misleading log line. The writer now treats any of its known list field names (enchant_data_list, equip_passive_skill_list, item_tag_list, the sealable family, transmutation_material_*, and others) as additive when the record does not already carry them. Thanks to hhkbble (GitHub #79) for the Oh_My_Thief.field.json minimal repro on Axiom Bracelet.",
+        ],
+    },
+    {
         "version": "3.2.15",
         "date": "2026-05-09",
         "notes": [

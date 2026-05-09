@@ -62,7 +62,15 @@ def _has_folder_variants(folder: Path) -> bool:
         return False
     try:
         from cdumm.gui.preset_picker import find_folder_variants
-        return len(find_folder_variants(folder)) >= 2
+        if len(find_folder_variants(folder)) >= 2:
+            return True
+        # Pattern 5 packs (Character Creator mod 837): mod.json wrapper
+        # with N sibling subfolders each carrying NNNN/0.paz. Without
+        # this fallback, the scanner clears configurable=0 on every
+        # startup and the cog disappears even though the side panel
+        # could swap variants.
+        from cdumm.engine.import_handler import find_loose_file_variants
+        return len(find_loose_file_variants(folder)) >= 2
     except Exception:
         return False
 

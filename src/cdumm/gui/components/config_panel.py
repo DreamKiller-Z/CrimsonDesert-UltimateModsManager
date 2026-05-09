@@ -20,46 +20,136 @@ _PRESET_KNOWN_VOCAB = frozenset(
 )
 
 
+def _detect_same_offset_preset_family(
+    patches: list[dict],
+) -> dict[str, list[int]] | None:
+    """Recognise a preset family encoded as "N patches at the same
+    (game_file, offset) sharing a meaningful label prefix" plus any
+    number of independent always-on patches at unique offsets.
+
+    Returns ``{tag: [idx, ...], "__always_on__": [idx, ...]}`` when a
+    family is found, else None. Each variant tag is the per-label
+    distinguishing piece after the common prefix.
+
+    Bug 2026-05-09 (Zowbaid, mod 356 Unlimited Dragon Flying): the
+    five "Ride Duration: 30 Minutes / 60 Minutes / ..." patches all
+    target offset 23357109 (mutually exclusive byte writes), but
+    none use a ``[Tag]`` prefix so the legacy detector returned None
+    and the user got 7 flat checkboxes.
+    """
+    # Bucket patches by (game_file, offset). A bucket with 2+
+    # patches is a candidate mutex family — only one byte sequence
+    # at one offset can win at apply time.
+    by_key: dict[tuple, list[int]] = {}
+    for i, p in enumerate(patches):
+        gf = p.get("game_file")
+        off = p.get("offset")
+        if gf is None or off is None:
+            return None  # not a byte-patch shape
+        by_key.setdefault((gf, off), []).append(i)
+
+    # Pick the LARGEST mutex bucket as the preset axis. CDUMM's
+    # config panel UI only exposes one preset radio row; if a mod
+    # had two independent preset axes we'd need a richer UI. Mod
+    # 356 has exactly one (Ride Duration). Anything else falls
+    # through to the second-largest, etc., later if needed.
+    mutex_buckets = [
+        (k, idxs) for k, idxs in by_key.items() if len(idxs) >= 2
+    ]
+    if not mutex_buckets:
+        return None
+    mutex_buckets.sort(key=lambda kv: -len(kv[1]))
+    family_indices = mutex_buckets[0][1]
+
+    # Find the longest common label prefix across the family.
+    family_labels = [str(patches[i].get("label", "")) for i in family_indices]
+    if not all(family_labels):
+        return None
+    prefix = family_labels[0]
+    for s in family_labels[1:]:
+        # Walk char-by-char until divergence.
+        m = 0
+        for a, b in zip(prefix, s):
+            if a != b:
+                break
+            m += 1
+        prefix = prefix[:m]
+    # Trim trailing whitespace + common label punctuation.
+    prefix = prefix.rstrip(" :-_/.,")
+    # Require at least 3 meaningful chars of common prefix so we
+    # don't synthesize a family from "Apple Bonus" + "Banana Bonus"
+    # (no shared head). Also reject a prefix that's entirely
+    # whitespace or punctuation.
+    meaningful = sum(1 for c in prefix if c.isalnum())
+    if meaningful < 3:
+        return None
+
+    # Distinguishing piece per variant: strip the common prefix
+    # plus any leading separator punctuation/whitespace.
+    def _trim_lead(s: str, head: str) -> str:
+        s = s[len(head):]
+        return s.lstrip(" :-_/.,")
+
+    groups: dict[str, list[int]] = {}
+    for idx in family_indices:
+        label = str(patches[idx].get("label", ""))
+        tag = _trim_lead(label, prefix) or label
+        groups.setdefault(tag, []).append(idx)
+
+    # Final sanity: distinct variant labels must still be 2+ after
+    # the prefix strip.
+    if len(groups) < 2:
+        return None
+
+    family_set = set(family_indices)
+    always_on = [i for i in range(len(patches)) if i not in family_set]
+    groups["__always_on__"] = always_on
+    return groups
+
+
 def detect_preset_groups(patches: list[dict]) -> dict[str, list[int]] | None:
     """Detect a preset selector encoded in V2 byte-patch labels.
 
-    Mod authors prefix every patch label with `[Tag]` to indicate the
-    preset variant it belongs to (e.g. `[0%] foo`, `[25%] foo`,
-    `[100%] foo`). When the full patch list forms such a family, return
-    {tag: [patch_index, ...]} preserving discovery order. Otherwise
-    return None.
+    Two recognized shapes:
 
-    A patch list qualifies only if EVERY label carries a `[Tag]` prefix,
-    there are 2+ distinct tags, and the tag set looks like a preset
-    family by one of:
-      * all tags are percent values (`-?\\d+(\\.\\d+)?%`),
-      * all tags are in the known vocab (Default, Off, On, Min/Max...),
-      * 3+ tags with identical patch counts (catches arbitrary preset
-        names like 'Lazy Run / Marathon / Sprint').
+    1. ``[Tag]`` prefix on every label (mod 1103 percent presets,
+       known-vocab presets like Default/Off/On, or N-equal-sized
+       arbitrary tag families).
+    2. Same ``(game_file, offset)`` shared by 2+ patches with a
+       common label prefix (Zowbaid's mod 356 Ride Duration pack).
+       Patches outside the mutex family are returned under the
+       magic ``"__always_on__"`` key so the UI can keep them as
+       independent toggles.
+
+    Returns the group dict on success, or None when no preset
+    family can be recognised.
     """
     groups: dict[str, list[int]] = {}
+    bracket_ok = True
     for i, patch in enumerate(patches):
         label = str(patch.get("label", ""))
         m = _PRESET_TAG_RE.match(label)
         if not m:
-            return None
+            bracket_ok = False
+            break
         tag = m.group("tag").strip()
         if not tag:
-            return None
+            bracket_ok = False
+            break
         groups.setdefault(tag, []).append(i)
 
-    if len(groups) < 2:
-        return None
+    if bracket_ok and len(groups) >= 2:
+        tags = list(groups)
+        if all(_PRESET_PERCENT_RE.match(t) for t in tags):
+            return groups
+        if all(t.lower() in _PRESET_KNOWN_VOCAB for t in tags):
+            return groups
+        counts = {len(idxs) for idxs in groups.values()}
+        if len(tags) >= 3 and len(counts) == 1:
+            return groups
 
-    tags = list(groups)
-    if all(_PRESET_PERCENT_RE.match(t) for t in tags):
-        return groups
-    if all(t.lower() in _PRESET_KNOWN_VOCAB for t in tags):
-        return groups
-    counts = {len(idxs) for idxs in groups.values()}
-    if len(tags) >= 3 and len(counts) == 1:
-        return groups
-    return None
+    # Fall through to same-offset mutex detection (mod 356 case).
+    return _detect_same_offset_preset_family(patches)
 
 
 def _group_variants_by_category_prefix(
@@ -367,6 +457,7 @@ class ConfigPanel(QWidget):
         # that its tag covers.
         self._preset_radio_group: QButtonGroup | None = None
         self._preset_groups: dict[str, list[int]] | None = None
+        self._preset_always_on_indices: list[int] = []
 
         self._anim = QPropertyAnimation(self, b"maximumWidth")
         self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
@@ -556,6 +647,7 @@ class ConfigPanel(QWidget):
         # stale QButtonGroup.
         self._preset_radio_group = None
         self._preset_groups = None
+        self._preset_always_on_indices = []
         self._apply_btn.setVisible(False)
 
         # Header
@@ -810,7 +902,14 @@ class ConfigPanel(QWidget):
         # The button group is parented to ``self`` so it survives the
         # body-clear cycle on the next show_mod call without leaking;
         # we reset the attr explicitly at the start of show_mod.
+        # Magic key from detect_preset_groups: indices of patches that
+        # live OUTSIDE the preset family (mod 356 Cooldown + HP Regen).
+        # These must keep whatever per-checkbox state the user set;
+        # picking a Ride Duration radio shouldn't unset Cooldown.
+        always_on = list(groups.get("__always_on__", []))
+        groups = {k: v for k, v in groups.items() if not k.startswith("__")}
         self._preset_groups = dict(groups)
+        self._preset_always_on_indices = always_on
         button_group = QButtonGroup(self)
         button_group.setExclusive(True)
         button_group.buttonClicked.connect(self._on_preset_selected)
@@ -871,7 +970,13 @@ class ConfigPanel(QWidget):
         if not self._preset_groups:
             return
         enable_indices = set(self._preset_groups.get(tag, []))
+        # Skip patches that aren't part of the preset family (mod 356
+        # always-on patches like Cooldown / HP Regen). The user's
+        # per-checkbox state for those is preserved.
+        always_on = set(getattr(self, "_preset_always_on_indices", []))
         for idx, toggle in self._toggles.items():
+            if idx in always_on:
+                continue
             toggle.setChecked(idx in enable_indices)
 
     def _save_preset_selection(self, tag: str) -> None:
