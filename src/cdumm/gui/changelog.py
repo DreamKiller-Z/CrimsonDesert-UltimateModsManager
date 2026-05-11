@@ -18,6 +18,13 @@ _UNRELEASED_NOTES: list[str] = []
 
 CHANGELOG = [
     {
+        "version": "3.3.2",
+        "date": "2026-05-11",
+        "notes": [
+            "<b>The Launch Game button no longer pretends the game started when Steam never actually got the request.</b> CDUMM hands the launch off to Steam via a <code>steam://rungameid/</code> URI so the DRM and overlay attach the normal way. If that hand-off failed for any reason (Steam client not running, the URI handler refusing the call, Steam offline), the previous code silently fell through to spawning the bare game exe. Crimson Desert is Themida plus Denuvo protected, so the bare exe spawns and gets killed within a fraction of a second. The <code>subprocess.Popen</code> call did not raise though, so CDUMM still showed a green Game launched toast and minimized itself to the taskbar while the game never actually appeared. Steam and Xbox installs now bail with a clear Could not reach Steam, make sure the Steam client is running message instead of the silent fake-success. Non-storefront installs keep the bare-exe fallback because they have no DRM bootstrap to bypass. zvitko-hue on GitHub #88 and d3dsh0t on GitHub #91 both hit this exact path; their bug-report logs contained <code>open_path: unexpected error opening steam://rungameid/3321460</code> right at the click moment, which proved the silent fallback was firing.",
+        ],
+    },
+    {
         "version": "3.3.1",
         "date": "2026-05-10",
         "notes": [
