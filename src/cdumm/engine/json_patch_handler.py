@@ -1638,7 +1638,14 @@ def _get_pamt_index(game_dir: Path) -> dict[str, PazEntry]:
     _key = "vanilla" if game_dir.name == "vanilla" else (
         "game_" + _hashlib.sha1(str(game_dir).encode("utf-8")).hexdigest()[:12]
     )
-    cache_path = cdmods / f".pamt_index_{_key}.cache"
+    # Cache version bumped to v2 on 2026-05-12 when basename-index
+    # disambiguation changed (first-seen-wins instead of last-seen-wins).
+    # Older v1 caches encode the buggy mapping where ui/iteminfo.pabgb
+    # overwrote gamedata/iteminfo.pabgb under the bare key
+    # "iteminfo.pabgb", and Format 3 mods like paloroycevincent-sketch's
+    # Combat God's Plate Gloves on GitHub #99 hit the wrong file.
+    # Bumping the filename forces a one-time rebuild on the next run.
+    cache_path = cdmods / f".pamt_index_v2_{_key}.cache"
     if cache_path.exists():
         try:
             cache_mtime = cache_path.stat().st_mtime
@@ -1680,7 +1687,24 @@ def _get_pamt_index(game_dir: Path) -> dict[str, PazEntry]:
                 ep = e.path.lower().replace("\\", "/")
                 index[ep] = e
                 bname = ep.rsplit("/", 1)[-1]
-                index[bname] = e
+                # First-seen-wins for bare-basename collisions. Crimson
+                # Desert ships two iteminfo.pabgb (one in gamedata/ in
+                # 0008/0.paz, one in ui/ in 0072/0.paz). The old code
+                # used a naive index[bname] = e, so 0072 overwrote
+                # 0008, and Format 3 mods targeting "iteminfo.pabgb"
+                # without a path prefix ended up reading the wrong
+                # file and erroring out with "vanilla bytes unavailable"
+                # because the writer's schema does not match the UI
+                # variant. paloroycevincent-sketch GitHub #99 reproduced
+                # this exactly. Because sorted(game_dir.iterdir())
+                # walks the numbered directories in ascending order,
+                # setdefault makes the lowest-numbered PAZ directory
+                # win, which for iteminfo.pabgb is 0008 = gamedata.
+                # Mod authors who want a specific path-distinguished
+                # variant should still use the full path (e.g.
+                # "ui/iteminfo.pabgb"); the exact-match branch in
+                # _find_pamt_entry handles those without ambiguity.
+                index.setdefault(bname, e)
         except Exception:
             continue
 
