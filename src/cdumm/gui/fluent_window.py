@@ -1851,11 +1851,28 @@ class CdummWindow(FluentWindow):
                 pass
 
         def _on_done(path: str) -> None:
+            # Faisal 2026-05-12 GitHub #108 (jscouron) and #109
+            # (Dragoon853): three users reported CDUMM crashing or
+            # freezing the moment the in-app update download reached
+            # 100%. The crash signature suggests one of the three
+            # post-download calls below was raising unhandled: the
+            # StateToolTip teardown, the InfoBar.success creation, or
+            # the file-manager reveal. Each call is now wrapped in
+            # its own try/except so a failure in one cannot crash the
+            # whole app or leave the StateToolTip stuck at 100%.
+            # Also explicitly close the tooltip (matches _on_failed)
+            # so it does not linger on screen indefinitely on certain
+            # qfluentwidgets versions where setState(True) alone
+            # leaves the tooltip visible.
             if tip is not None:
                 try:
                     tip.setState(True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("StateToolTip setState failed: %s", e)
+                try:
+                    tip.close()
+                except Exception as e:
+                    logger.debug("StateToolTip close failed: %s", e)
             try:
                 InfoBar.success(
                     tr("update.downloaded_title"),
@@ -1863,7 +1880,13 @@ class CdummWindow(FluentWindow):
                     duration=8000, position=InfoBarPosition.TOP, parent=self)
             except Exception as e:
                 logger.debug("downloaded InfoBar failed: %s", e)
-            self._reveal_in_file_manager(path)
+            try:
+                self._reveal_in_file_manager(path)
+            except Exception as e:
+                logger.warning(
+                    "Reveal-in-file-manager raised after update "
+                    "download finished (file %r is still saved): %s",
+                    path, e)
 
         def _on_failed(reason: str) -> None:
             if tip is not None:
