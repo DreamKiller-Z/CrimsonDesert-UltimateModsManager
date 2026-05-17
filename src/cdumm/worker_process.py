@@ -102,6 +102,44 @@ def _run_import(mod_path: str, game_dir: str, db_path: str,
     handler = dispatch.get(fmt)
     if handler is None:
         suffix = mod_path.suffix.lower()
+        # GitHub #136 lupo1190: bare-.json drops of malformed JSON returned
+        # 'Unsupported file format: .json' because every detector
+        # (detect_json_patch, is_natt_format_3) calls json.load() and
+        # treats JSONDecodeError as 'not my format'. With no detector
+        # matching, the dispatch falls through to here. Try parsing the
+        # file ourselves so the mod author / user sees the actual line
+        # and column of their syntax error instead of a generic message.
+        if suffix == ".json":
+            try:
+                with open(mod_path, "r", encoding="utf-8-sig") as _f:
+                    import json as _json
+                    _json.load(_f)
+            except (FileNotFoundError, OSError) as _e_io:
+                _emit({"type": "error",
+                       "msg": f"Could not read {mod_path.name}: {_e_io}"})
+                db.close()
+                return
+            except Exception as _e_parse:
+                # json.JSONDecodeError exposes lineno, colno, msg.
+                lineno = getattr(_e_parse, "lineno", None)
+                colno = getattr(_e_parse, "colno", None)
+                parse_msg = getattr(_e_parse, "msg", str(_e_parse))
+                if lineno is not None and colno is not None:
+                    detail = (
+                        f"line {lineno}, col {colno}: {parse_msg}")
+                else:
+                    detail = parse_msg
+                _emit({"type": "error",
+                       "msg": (
+                           f"{mod_path.name} is not valid JSON: "
+                           f"{detail}. The mod author likely typed the "
+                           f"JSON by hand and missed a comma, bracket, "
+                           f"or quote. Run the file through a JSON "
+                           f"validator (e.g. jsonlint.com) and share "
+                           f"the line number above with the author."
+                       )})
+                db.close()
+                return
         msg = f"Unsupported file format: {suffix or 'unknown'}"
         _emit({"type": "error", "msg": msg})
         db.close()
