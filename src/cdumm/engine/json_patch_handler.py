@@ -2452,7 +2452,8 @@ def process_json_patches_for_overlay(
 
         # v2 entry-anchored: build name→offset map when any change uses `entry`
         name_offsets = None
-        if any(c.get("entry") for c in changes):
+        any_entry_anchored = any(c.get("entry") for c in changes)
+        if any_entry_anchored:
             pabgh_file = game_file.rsplit(".", 1)[0] + ".pabgh"
             pabgh_entry = None
             if vanilla_source_resolver is not None:
@@ -2469,9 +2470,34 @@ def process_json_patches_for_overlay(
                     pabgh_plain = _extract_from_paz(pabgh_entry)
                     name_offsets = _build_name_offsets_for_v2(
                         game_file, bytes(plaintext), pabgh_plain)
+                    # GitHub #105 pitonpp diagnostic: when this lookup
+                    # silently mismatches on macOS, mount-time can't
+                    # resolve any entry-anchored change. Log the index
+                    # state so the next bundle pins the failure stage.
+                    if name_offsets is None:
+                        logger.warning(
+                            "mount-time: v2 index for %r built but "
+                            "_build_name_offsets returned None "
+                            "(plaintext=%d bytes, pabgh=%d bytes)",
+                            game_file, len(plaintext), len(pabgh_plain))
+                    else:
+                        logger.info(
+                            "mount-time: v2 index for %r ready "
+                            "(%d named offsets across %d entry-anchored "
+                            "changes)", game_file, len(name_offsets),
+                            sum(1 for c in changes if c.get("entry")))
                 except Exception as e_pabgh:
                     logger.warning("mount-time: v2 index build failed for %s: %s",
                                    pabgh_file, e_pabgh)
+            else:
+                logger.warning(
+                    "mount-time: companion pabgh %r not found in "
+                    "vanilla or game dir; %d entry-anchored change(s) "
+                    "for %r cannot be applied without an entry "
+                    "offset map (#105 pitonpp macOS diagnostic)",
+                    pabgh_file,
+                    sum(1 for c in changes if c.get("entry")),
+                    game_file)
 
         # All-or-nothing per mod (Faisal 2026-05-04): if any of a
         # mod's changes mismatch vanilla, drop EVERY change from that
@@ -2494,6 +2520,29 @@ def process_json_patches_for_overlay(
 
         # Apply byte patches with pattern scan against vanilla. Also capture
         # inserts so we can shift a companion .pabgh (JMM parity).
+        # #105 pitonpp macOS diagnostic: log the shape of the first
+        # few changes so future bundles surface whether the changes
+        # carry entry-anchored or absolute-offset fields, and whether
+        # `original` / `patched` hex strings are present and non-empty.
+        # This is the input contract for _apply_byte_patches; if it
+        # gets unexpected shapes, applied=0 silently.
+        try:
+            _shape_sample = [
+                {k: (v[:24] + "..." if isinstance(v, str) and len(v) > 24 else v)
+                 for k, v in c.items()
+                 if k in ("entry", "rel_offset", "offset", "original",
+                          "patched", "_target_file")}
+                for c in changes[:3]
+            ]
+            logger.info(
+                "mount-time: _apply_byte_patches input for %r: %d "
+                "change(s), entry-anchored=%s, name_offsets=%s, "
+                "first 3 shapes=%s",
+                game_file, len(changes), any_entry_anchored,
+                "ready" if name_offsets is not None else "None",
+                _shape_sample)
+        except Exception as _e_diag:
+            logger.debug("change-shape diagnostic failed: %s", _e_diag)
         modified = bytearray(plaintext)
         inserts_out: list[tuple[int, int]] = []
         applied, mismatched, relocated = _apply_byte_patches(
