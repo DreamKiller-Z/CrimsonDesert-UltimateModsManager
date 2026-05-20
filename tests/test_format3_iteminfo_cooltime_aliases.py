@@ -69,6 +69,39 @@ def test_aliased_intents_keep_their_new_value():
         assert intent.new == 180000
 
 
+def test_docking_child_data_intents_pass_validation(tmp_path):
+    """GitHub #135: docking_child_data is an `optional` struct in the
+    iteminfo schema (stream_size=0), which the schema walker rejected
+    as variable-length. The iteminfo writer's nested-path resolver
+    handles both the bare whole-struct set and the dotted subfield
+    form, so the validator must early-accept them."""
+    import json
+    from cdumm.engine.format3_handler import validate_intents
+    doc = {
+        "format": 3,
+        "format_minor": 1,
+        "modinfo": {"title": "docking probe", "version": "1.0"},
+        "targets": [{
+            "file": "iteminfo.pabgb",
+            "intents": [
+                {"entry": "X", "key": 1, "field": "docking_child_data",
+                 "op": "set", "new": {"gimmick_info_key": 1008474}},
+                {"entry": "Y", "key": 2,
+                 "field": "docking_child_data.gimmick_info_key",
+                 "op": "set", "new": 1008474},
+            ],
+        }],
+    }
+    p = tmp_path / "docking.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    target, intents = parse_format3_mod_targets(p)[0]
+    v = validate_intents(target, intents)
+    assert len(v.supported) == 2, (
+        f"both docking intents should validate, "
+        f"got supported={len(v.supported)} skipped={len(v.skipped)}")
+    assert len(v.skipped) == 0
+
+
 def test_alias_map_only_applies_to_iteminfo(tmp_path):
     """A cooltime.a intent on a non-iteminfo target is left alone —
     the alias map is iteminfo-specific."""

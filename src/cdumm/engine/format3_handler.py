@@ -682,7 +682,10 @@ def _diagnose_unsupported_intent(
             f = field or ""
             if (f.startswith("prefab_data_list[")
                     or f.startswith("drop_default_data.")
-                    or f.startswith("gimmick_visual_prefab_data_list[")):
+                    or f.startswith("gimmick_visual_prefab_data_list[")
+                    # GitHub #135: docking_child_data.<subfield> resolves
+                    # via the iteminfo writer's nested-path walker.
+                    or f.startswith("docking_child_data.")):
                 return None
         return (
             f"field '{field}' targets a nested struct sub-field "
@@ -787,6 +790,20 @@ def _classify_intent(
         intent.field.startswith("prefab_data_list[")
         or intent.field.startswith("drop_default_data.")
         or intent.field.startswith("gimmick_visual_prefab_data_list[")
+        # GitHub #135 (Better Unique Gears): docking_child_data is an
+        # `optional` struct in the iteminfo schema, so the schema
+        # walker reports stream_size=0 and rejects it as
+        # variable-length. The iteminfo writer's nested-path resolver
+        # (iteminfo_writer.py _resolve_path_target) handles both the
+        # bare `docking_child_data` whole-struct set and the dotted
+        # `docking_child_data.<subfield>` form, so early-accept here
+        # lets those intents reach the writer. Extra struct keys the
+        # mod ships (inherit_summoner, summon_tag_name_hash) that the
+        # 1.07.00 binary does not carry are simply ignored by
+        # _write_DockingChildData. Verified the iteminfo round-trip is
+        # byte-perfect so the struct layout is correct.
+        or intent.field == "docking_child_data"
+        or intent.field.startswith("docking_child_data.")
         # Faisal 2026-05-12 GitHub #99 (paloroycevincent-sketch /
         # Combat God's Plate Gloves): the iteminfo native writer has
         # explicit byte-perfect round-trip support for these three
