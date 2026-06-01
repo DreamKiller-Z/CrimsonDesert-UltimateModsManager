@@ -6209,9 +6209,49 @@ class CdummWindow(FluentWindow):
                 # and falls back to the verified Crimson Desert AppID (3321460).
                 from cdumm.engine.game_monitor import get_steam_app_id
                 app_id = get_steam_app_id(self._game_dir)
-                uri = f"steam://rungameid/{app_id}"
-                logger.info("Launching via Steam URI: %s", uri)
-                open_path(uri)
+                # #186 (lupo1190): Steam's "Game configuration unavailable"
+                # error fires on some 1.09 installs when CDUMM uses the
+                # steam://rungameid URI, but a normal Steam Client click
+                # launches fine. The two paths go through different
+                # internal Steam wrappers and one of them broke for that
+                # user. ``steam_launch_method`` config (default ``uri``)
+                # lets the affected user opt into the steam.exe
+                # -applaunch alternative, which mirrors what the Steam
+                # Client itself does when you press Play. No automatic
+                # fallback because the URI path returns immediately
+                # whether Steam ever launched the game or not, so we
+                # cannot detect URI failure without polling for the game
+                # process; the user-driven setting avoids that fragility.
+                method = ""
+                try:
+                    from cdumm.storage.config import Config
+                    if self._db:
+                        method = (Config(self._db).get(
+                            "steam_launch_method") or "").strip().lower()
+                except Exception as _cfg_e:
+                    logger.debug("steam_launch_method lookup failed: %s", _cfg_e)
+                if method == "applaunch":
+                    from cdumm.storage.game_finder import _find_steam_root
+                    steam_root = _find_steam_root()
+                    steam_exe = steam_root / "steam.exe" if steam_root else None
+                    if steam_exe and steam_exe.exists():
+                        logger.info(
+                            "Launching via Steam -applaunch fallback: "
+                            "%s -applaunch %s", steam_exe, app_id)
+                        subprocess.Popen(
+                            [str(steam_exe), "-applaunch", str(app_id)])
+                    else:
+                        logger.warning(
+                            "steam_launch_method=applaunch but steam.exe "
+                            "not found (steam_root=%s); falling back to "
+                            "URI", steam_root)
+                        uri = f"steam://rungameid/{app_id}"
+                        logger.info("Launching via Steam URI: %s", uri)
+                        open_path(uri)
+                else:
+                    uri = f"steam://rungameid/{app_id}"
+                    logger.info("Launching via Steam URI: %s", uri)
+                    open_path(uri)
             elif xbox:
                 # Xbox Game Pass -- launch through the Xbox app
                 logger.info("Launching via Xbox shell URI")
