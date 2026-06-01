@@ -4971,61 +4971,40 @@ class CdummWindow(FluentWindow):
                     "UPDATE mods SET drop_name = ? WHERE id = ?",
                     (drop_name, mod_id))
                 # #187 (Balzhur): the import worker already wrote the
-                # version from the mod's manifest (modinfo.json for PAZ
-                # mods, the version field for JSON-patch mods) into the
-                # mods.version column. Trust that value first. The
-                # previous post-import logic immediately overwrote it
-                # with whatever _get_drop_version parsed out of the
-                # Nexus filename, which is a stale version when the
-                # mod author bumped the manifest without renaming the
-                # archive ("Easier QTE x2" v1.2.1 packaged in a 1-1
-                # filename slot, reported as v1.1).
-                #
-                # The two cases that legitimately need a post-import
-                # version bump are:
-                #   1. Click-to-update downloads (nxm_<mod>_<file>.bin
-                #      temp filename, no modinfo, GitHub #164). The
-                #      manifest path returns nothing and we need the
-                #      cached Nexus latest_version instead.
-                #   2. Imports with no manifest at all, where the DB
-                #      row carries the import-handler default ("1.0")
-                #      and the filename DOES expose a real version.
-                # Both fall through the manifest_ver check below.
+                # version from the mod's manifest into mods.version.
+                # Resolve precedence via cdumm.engine.version_picker so
+                # the rule lives in one place and is unit-tested.
+                from cdumm.engine.version_picker import pick_post_import_version
                 row = self._db.connection.execute(
                     "SELECT version FROM mods WHERE id = ?", (mod_id,)).fetchone()
                 manifest_ver = (row[0] or "").strip() if row else ""
-                is_click_to_update = (
-                    orig is not None and orig.name.startswith("nxm_")
-                    and orig.name.endswith(".bin"))
-                drop_ver = ""
-                if not manifest_ver or manifest_ver == "1.0" or is_click_to_update:
-                    drop_ver = self._get_drop_version(orig) if orig else ""
-                    if not drop_ver:
-                        drop_ver = self._get_drop_version(path)
-                    # Click-to-update Nexus fallback (issue #164).
-                    if not drop_ver:
-                        nm_id = nexus_id
-                        if not nm_id:
-                            try:
-                                row = self._db.connection.execute(
-                                    "SELECT nexus_mod_id FROM mods WHERE id = ?",
-                                    (mod_id,)).fetchone()
-                                if row and row[0]:
-                                    nm_id = int(row[0])
-                            except Exception:
-                                nm_id = None
-                        if nm_id:
-                            latest = getattr(self, "_nexus_updates", None) or {}
-                            cached = latest.get(int(nm_id))
-                            cached_ver = getattr(cached, "latest_version", "") if cached else ""
-                            if cached_ver:
-                                drop_ver = cached_ver.strip()
-                    if not drop_ver:
-                        drop_ver = manifest_ver
-                if drop_ver and drop_ver != manifest_ver:
+                nm_id = nexus_id
+                if not nm_id:
+                    try:
+                        row = self._db.connection.execute(
+                            "SELECT nexus_mod_id FROM mods WHERE id = ?",
+                            (mod_id,)).fetchone()
+                        if row and row[0]:
+                            nm_id = int(row[0])
+                    except Exception:
+                        nm_id = None
+                cached_ver: str | None = None
+                if nm_id:
+                    latest = getattr(self, "_nexus_updates", None) or {}
+                    cached = latest.get(int(nm_id))
+                    raw = getattr(cached, "latest_version", "") if cached else ""
+                    cached_ver = raw.strip() if raw else None
+                new_ver = pick_post_import_version(
+                    manifest_ver=manifest_ver,
+                    orig_path=orig,
+                    fallback_path=path,
+                    nexus_cached_version=cached_ver,
+                    get_drop_version=self._get_drop_version,
+                )
+                if new_ver is not None:
                     self._db.connection.execute(
                         "UPDATE mods SET version = ? WHERE id = ?",
-                        (drop_ver, mod_id))
+                        (new_ver, mod_id))
                 self._db.connection.commit()
             except Exception:
                 pass
