@@ -51,6 +51,54 @@ from cdumm.engine.nexus_filename import parse_nexus_filename as _parse_nexus_fil
 from cdumm.gui.import_context import snapshot_and_clear_import_context
 
 
+class _UpdateDLDispatcher(QObject):
+    """Thread-affinity adapter for UpdateDownloadWorker signals.
+
+    Verified empirically against PySide6 6.x: connecting a worker signal
+    to a free Python callable with Qt.QueuedConnection runs the slot on
+    the SENDER thread, not the receiver's. There is no QObject receiver
+    to anchor the queue to, so Qt uses the sender's thread.
+
+    GitHub #170 was caused by exactly that: _on_done ran on the download
+    worker thread, then InfoBar.success tried to parent a new widget to
+    the main-thread main window and Qt refused with "QObject::setParent:
+    Cannot set parent, new parent is in a different thread".
+
+    This dispatcher is a small QObject parented to the main window, so
+    it lives on the main thread. Connecting the worker signals to its
+    bound methods means Qt has a QObject receiver with main-thread
+    affinity, and QueuedConnection routes the call onto the main thread
+    event loop where InfoBar and QTimer work.
+    """
+
+    def __init__(self, parent, on_progress, on_done, on_failed):
+        super().__init__(parent)
+        self._on_progress = on_progress
+        self._on_done = on_done
+        self._on_failed = on_failed
+
+    @Slot(int, int)
+    def progress(self, received: int, total: int) -> None:
+        try:
+            self._on_progress(received, total)
+        except Exception as e:
+            logger.warning("update-dl dispatcher progress raised: %s", e)
+
+    @Slot(str)
+    def done(self, path: str) -> None:
+        try:
+            self._on_done(path)
+        except Exception as e:
+            logger.warning("update-dl dispatcher done raised: %s", e)
+
+    @Slot(str)
+    def failed(self, reason: str) -> None:
+        try:
+            self._on_failed(reason)
+        except Exception as e:
+            logger.warning("update-dl dispatcher failed raised: %s", e)
+
+
 def _quiet_qprocess(proc) -> None:
     """Suppress the brief console window flash when ``QProcess`` spawns
     a Windows subprocess.
@@ -1929,20 +1977,23 @@ class CdummWindow(FluentWindow):
                 logger.debug("download-failed InfoBar failed: %s", e)
             QDesktopServices.openUrl(QUrl(release_url))
 
-        # #170 (Elec0 / jikulopo / devCKVargas / AwfulLon): PySide6
-        # defaults a signal-to-Python-callable connection to
-        # DirectConnection because a free function has no thread
-        # affinity, which means the slot ran in the WORKER thread when
-        # the download finished. _on_done then tried to create an
-        # InfoBar parented to self (main window, main thread), and Qt
-        # refused with "Cannot set parent, new parent is in a
-        # different thread", silently freezing the UI. QTimer.singleShot
-        # for the deferred reveal also no-op'd because the worker has
-        # no event loop. Force QueuedConnection so every slot runs on
-        # the main thread, where InfoBar and QTimer work.
-        worker.progress.connect(_on_progress, Qt.ConnectionType.QueuedConnection)
-        worker.done.connect(_on_done, Qt.ConnectionType.QueuedConnection)
-        worker.failed.connect(_on_failed, Qt.ConnectionType.QueuedConnection)
+        # #170 (Elec0 / jikulopo / devCKVargas / AwfulLon): the v3.3.15
+        # attempt at this added Qt.QueuedConnection on the same three
+        # connect calls. That was the right diagnosis (slot must run on
+        # main thread for InfoBar.success to parent without crashing)
+        # but the wrong mechanism — jikulopo's instrumented run on
+        # 2026-05-31 proved the slot STILL ran on the worker thread
+        # after the v3.3.15 build. Verified empirically: PySide6 6.x
+        # QueuedConnection to a free Python callable routes the call to
+        # the SENDER's thread, not main, because there is no QObject
+        # receiver to anchor the queue. _UpdateDLDispatcher is a small
+        # QObject parented to ``self`` so it lives on main, and Qt sees
+        # its bound methods as receivers with main-thread affinity.
+        dispatch = _UpdateDLDispatcher(self, _on_progress, _on_done, _on_failed)
+        worker.progress.connect(dispatch.progress, Qt.ConnectionType.QueuedConnection)
+        worker.done.connect(dispatch.done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(dispatch.failed, Qt.ConnectionType.QueuedConnection)
+        self._update_dl_dispatch = dispatch
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
