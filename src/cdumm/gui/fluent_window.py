@@ -7653,16 +7653,12 @@ class CdummWindow(FluentWindow):
         logger.info("Snapshot callback: %d files", count)
         self._sync_db()
 
-        # Save game version fingerprint with the snapshot
-        try:
-            from cdumm.engine.version_detector import detect_game_version
-            from cdumm.storage.config import Config
-            fp = detect_game_version(self._game_dir)
-            if fp:
-                Config(self._db).set("game_version_fingerprint", fp)
-                logger.info("Saved game version fingerprint: %s", fp)
-        except Exception:
-            pass
+        # The snapshot worker stamps game_version_fingerprint inside its
+        # own DB transaction now (#163 fix in snapshot_manager.py), so the
+        # value is already persisted by the time we get here. The old
+        # main-thread write that lived here lost a cross-process lock race
+        # and swallowed the error, leaving a stale fingerprint that
+        # re-triggered recovery on every launch. Do not reintroduce it.
 
         # D1: rescan succeeded — clear the stale-snapshot flag so
         # Apply unlocks without requiring a restart.
