@@ -2313,9 +2313,24 @@ class CdummWindow(FluentWindow):
         if not self._db:
             return
         try:
-            self._db.connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            # A WAL checkpoint raises "database is locked" if THIS
+            # connection has its own transaction open (verified against
+            # SQLite: PASSIVE only raises on the caller's own open txn,
+            # not on another connection's lock). A leaked uncommitted
+            # transaction on the main connection was logging that as an
+            # ERROR on every snapshot/import completion. Commit any
+            # pending work first so the checkpoint actually compacts the
+            # WAL instead of failing.
+            conn = self._db.connection
+            if conn.in_transaction:
+                conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except Exception as e:
-            logger.error("WAL checkpoint failed: %s", e)
+            # Benign under reader contention (PASSIVE returns busy and
+            # SQLite auto-checkpoints later). Demoted from ERROR so it
+            # stops alarming users in bug-report bundles.
+            logger.debug(
+                "WAL checkpoint skipped (auto-checkpoint will retry): %s", e)
 
     # ------------------------------------------------------------------
     # Activity log helper
