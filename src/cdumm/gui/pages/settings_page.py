@@ -215,6 +215,7 @@ class SettingsPage(SmoothScrollArea):
         self._steam_launch_method_combo.addItems([
             tr("settings.steam_launch_method_uri"),
             tr("settings.steam_launch_method_applaunch"),
+            tr("settings.steam_launch_method_exe"),
         ])
         self._steam_launch_method_combo.setFixedWidth(220)
         self._steam_launch_method_combo.setStyleSheet(
@@ -641,9 +642,11 @@ class SettingsPage(SmoothScrollArea):
         self._hide_on_launch_switch.blockSignals(False)
 
         # Steam launch method (#186). Default index 0 = URI (current
-        # behavior), index 1 = applaunch fallback.
+        # behavior), index 1 = applaunch fallback, index 2 = run the
+        # game exe directly (what DMM does; bypasses the Steam handoff
+        # entirely for installs where the URI errors).
         launch_method = (self._config.get("steam_launch_method") or "").strip().lower()
-        method_idx = 1 if launch_method == "applaunch" else 0
+        method_idx = {"applaunch": 1, "exe": 2}.get(launch_method, 0)
         self._steam_launch_method_combo.blockSignals(True)
         self._steam_launch_method_combo.setCurrentIndex(method_idx)
         self._steam_launch_method_combo.blockSignals(False)
@@ -771,7 +774,7 @@ class SettingsPage(SmoothScrollArea):
         """Persist the Steam launch method preference (GitHub #186)."""
         if self._config is None:
             return
-        value = "applaunch" if idx == 1 else "uri"
+        value = {1: "applaunch", 2: "exe"}.get(idx, "uri")
         self._config.set("steam_launch_method", value)
         logger.info("Steam launch method set to %s", value)
 

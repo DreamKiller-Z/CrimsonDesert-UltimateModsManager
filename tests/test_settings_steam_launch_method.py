@@ -67,3 +67,24 @@ def test_dropdown_change_persists_to_config(qtbot, app, db, tmp_path):
 
     page._steam_launch_method_combo.setCurrentIndex(0)
     assert Config(db).get("steam_launch_method") == "uri"
+
+
+def test_exe_option_round_trips(qtbot, app, db, tmp_path):
+    """#186 round 2: lupo's Steam refuses BOTH the rungameid URI and
+    -applaunch ('Game configuration unavailable') while DMM's direct
+    exe launch works on the same machine. The third dropdown option
+    persists 'exe' and loads back into index 2."""
+    from cdumm.gui.pages.settings_page import SettingsPage
+
+    page = SettingsPage()
+    qtbot.addWidget(page)
+    page.set_managers(db=db, game_dir=tmp_path)
+    assert page._steam_launch_method_combo.count() == 3
+
+    page._steam_launch_method_combo.setCurrentIndex(2)
+    assert Config(db).get("steam_launch_method") == "exe"
+
+    page2 = SettingsPage()
+    qtbot.addWidget(page2)
+    page2.set_managers(db=db, game_dir=tmp_path)
+    assert page2._steam_launch_method_combo.currentIndex() == 2

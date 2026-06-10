@@ -6369,7 +6369,24 @@ class CdummWindow(FluentWindow):
                             "steam_launch_method") or "").strip().lower()
                 except Exception as _cfg_e:
                     logger.debug("steam_launch_method lookup failed: %s", _cfg_e)
-                if method == "applaunch":
+                if method == "exe":
+                    # #186 (lupo1190): his Steam errors with "Game
+                    # configuration unavailable" on BOTH the rungameid
+                    # URI and -applaunch, yet DMM's start button works
+                    # on the same machine. DMM launches the game exe
+                    # directly ("Launched directly (direct launch ...
+                    # Steam integrity check bypassed)" in its binary),
+                    # which proves Themida/Denuvo tolerate a direct
+                    # spawn while the Steam client is running. Opt-in
+                    # only — the Steam handoff stays the default so
+                    # overlay/cloud behaviour is unchanged for everyone
+                    # else.
+                    logger.info(
+                        "Launching game exe directly (steam_launch_"
+                        "method=exe): %s", exe)
+                    subprocess.Popen(
+                        [str(exe)], cwd=str(self._game_dir / "bin64"))
+                elif method == "applaunch":
                     from cdumm.storage.game_finder import _find_steam_root
                     # #186: derive steam.exe from the game's own location
                     # (game_dir.parents[2]) first; _find_steam_root alone
