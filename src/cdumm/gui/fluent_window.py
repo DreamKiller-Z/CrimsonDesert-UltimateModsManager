@@ -543,6 +543,29 @@ def _decide_auth_banner(
     return (False, False)
 
 
+def _merge_nexus_updates(prev: dict, new: dict) -> dict:
+    """Merge one update-check cycle's results over the previous state.
+
+    check_mod_updates only returns entries for mods whose file list it
+    actually fetched this cycle; mods skipped by the 1-week feed
+    optimisation are absent from ``new``. Replacing the state dict
+    wholesale therefore WIPED known-outdated entries whenever a later
+    cycle skipped them — the user's red pills flipped back to
+    "up-to-date" ~30s after a check that had just found updates,
+    because the first check stamped nexus_last_checked_at and the
+    second cycle feed-skipped everything (#194, GabrielNunesIT).
+
+    Skipped mods keep their last known state (that is the feed-skip's
+    own premise), freshly checked mods get overwritten, and failure
+    cycles (auth error / rate limit / transport — ``new`` is empty)
+    leave the previous state untouched. Returns a new dict; neither
+    input is mutated.
+    """
+    merged = dict(prev or {})
+    merged.update(new or {})
+    return merged
+
+
 def _resolve_post_import_target_id(
     result_mod_id: int | None,
     existing_mod_id: int | None,
@@ -1460,7 +1483,13 @@ class CdummWindow(FluentWindow):
                 logger.info(
                     "nexus_real_file_id: backfilled %d row(s)",
                     persisted)
-        self._nexus_updates = getattr(self, "_pending_nexus_updates", {})
+        # #194: merge over the previous state instead of replacing it.
+        # A cycle only returns entries for mods it actually fetched;
+        # feed-skipped mods must keep their known state or red pills
+        # vanish 30s after a successful check.
+        self._nexus_updates = _merge_nexus_updates(
+            getattr(self, "_nexus_updates", {}),
+            getattr(self, "_pending_nexus_updates", {}))
         if hasattr(self, 'paz_mods_page'):
             self.paz_mods_page.set_nexus_updates(self._nexus_updates)
         if hasattr(self, 'asi_plugins_page'):
