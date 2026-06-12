@@ -1346,12 +1346,16 @@ class CdummWindow(FluentWindow):
         try:
             cursor = self._db.connection.execute(
                 "SELECT id, name, version, nexus_mod_id, nexus_last_checked_at, "
-                "nexus_real_file_id "
+                "nexus_real_file_id, drop_name "
                 "FROM mods WHERE mod_type = 'paz'")
+            # drop_name carries the ORIGINAL Nexus filename; the name
+            # matcher falls back to it when the user renamed the mod
+            # (Faisal, 2026-06-11).
             mods = [{"id": r[0], "name": r[1], "version": r[2],
                      "nexus_mod_id": r[3],
                      "nexus_last_checked_at": r[4],
-                     "nexus_real_file_id": r[5]}
+                     "nexus_real_file_id": r[5],
+                     "drop_name": r[6]}
                     for r in cursor.fetchall()]
             # Bug 43: read the new columns (nexus_real_file_id lets
             # the chain walk find the author-declared successor;

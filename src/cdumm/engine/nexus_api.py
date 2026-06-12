@@ -494,6 +494,22 @@ def get_mod_files(mod_id: int, api_key: str
         return files, updates
     except (NexusAuthError, NexusRateLimited):
         raise
+    except urllib.error.HTTPError as e:
+        # 403/404 are PERMANENT page states (mod hidden by moderation,
+        # set to hidden by the author, or removed), not transient
+        # failures. Return a distinguishable sentinel so the update
+        # check can tell the user "source gone on Nexus" instead of
+        # silently retrying every cycle forever and leaving the mod in
+        # the unknown-grey state (Faisal, 2026-06-11: Can It Stack,
+        # mod 2180, returns 403 and never showed a status).
+        if e.code in (403, 404):
+            logger.info(
+                "Mod %d page returned HTTP %d: hidden or removed on "
+                "Nexus", mod_id, e.code)
+            return None, None
+        logger.warning("Failed to get files for mod %d: HTTP %s %s",
+                       mod_id, e.code, e.reason)
+        return None
     except Exception as e:
         logger.warning("Failed to get files for mod %d: %s", mod_id, e)
         return None
@@ -759,6 +775,27 @@ def check_mod_updates(
             # next run retries. Silently-dropping this was Codex P1.
             continue
         files, file_updates = result
+        if files is None:
+            # (None, None) sentinel: the mod page itself returned
+            # 403/404 (hidden by moderation / author / removed).
+            # Permanent state, so emit a status the UI can show
+            # ("source removed" badge) instead of leaving the mod
+            # unknown-grey and re-fetching every cycle forever
+            # (Faisal, 2026-06-11: Can It Stack, mod 2180).
+            ver = str(mod.get("version") or "")
+            results.append(ModUpdateStatus(
+                mod_id=nexus_id,
+                local_name=str(mod.get("name") or ""),
+                local_version=ver,
+                latest_version=ver,
+                has_update=False,
+                mod_url=(f"https://www.nexusmods.com/"
+                         f"{GAME_DOMAIN}/mods/{nexus_id}"),
+                file_deleted_on_nexus=True,
+            ))
+            if mod.get("id") is not None and isinstance(mod["id"], int):
+                checked_mod_row_ids.append(mod["id"])
+            continue
         # files is a list (possibly empty). Empty = no uploads, valid.
         if mod.get("id") is not None and isinstance(mod["id"], int):
             checked_mod_row_ids.append(mod["id"])
@@ -899,9 +936,40 @@ def check_mod_updates(
             # current files list. Fall back to the name-match path.
             candidates = _filter_files_by_name(files, local_name)
             if not candidates:
-                logger.debug(
+                # The display name is user-renamable ("Graphics Mod"),
+                # but drop_name preserves the ORIGINAL Nexus filename
+                # ("Enhanced Internal Graphics V2.8-651-2-8-1-...")
+                # which is exactly what the page's file names look
+                # like. Strip the -<modid>-<version>-<timestamp>
+                # suffix and retry the match with it (Faisal,
+                # 2026-06-11: renamed rows with no stored file_id
+                # never matched and stayed unknown-grey).
+                drop = str(mod.get("drop_name") or "")
+                if drop:
+                    base = re.sub(
+                        r"-\d+(?:-[\w.]+)*-\d{6,}(?:\.\w+)?$", "", drop)
+                    base = base.replace("_", " ").strip()
+                    if base and base.lower() != local_name.lower():
+                        candidates = _filter_files_by_name(files, base)
+                        if candidates:
+                            logger.info(
+                                "update check: matched %r via its "
+                                "original Nexus filename %r (display "
+                                "name was renamed)", local_name, base)
+            if not candidates:
+                # INFO, not debug: this is the one remaining cause of
+                # a permanently-grey pill (author renamed the file
+                # line on Nexus, so neither display name nor original
+                # filename matches; mod 651 went from "Enhanced
+                # Internal Graphics" to "InternalGraphicsMod"). The
+                # row heals permanently once the user updates or
+                # re-links the mod (the import stores the file id and
+                # the chain walk takes over).
+                logger.info(
                     "update check: no Nexus file matches local mod %r "
-                    "(nexus_mod_id=%d, %d files on page)",
+                    "(nexus_mod_id=%d, %d files on page). The author "
+                    "may have renamed the file line; updating or "
+                    "re-linking this mod once will fix its tracking.",
                     local_name, nexus_id, len(files))
                 # Round-3 fix: when we have a deleted/archived signal
                 # but no matching candidate, still emit a result so
