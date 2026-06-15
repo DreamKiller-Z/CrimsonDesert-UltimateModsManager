@@ -15,6 +15,7 @@ from cdumm.i18n import tr
 # move them up under a real {"version": "X.Y.Z", "date": "..."} block.
 # This keeps __version__ stable until you actually cut a release.
 _UNRELEASED_NOTES: list[str] = [
+    "<b>Mod preset/toggle picker no longer traps the app off-screen.</b> A JSON mod whose preset opens the toggle picker with many options grew the modal taller than the window, pushing the Apply/Cancel buttons off the bottom -- the dialog was unclickable and the whole app looked frozen, forcing an End Task. The toggle picker now caps its scroll height to the parent window the same way the import preset picker already does (#200), so the list scrolls internally and the buttons stay visible. Reported on GitHub (#196).",
 ]
 
 CHANGELOG = [
