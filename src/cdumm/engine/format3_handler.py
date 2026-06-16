@@ -870,6 +870,16 @@ def _classify_intent(
             "unk_post_cooltime_a",
             "unk_post_cooltime_b",
         }
+        # GitHub #191 (AbyssGearUnlock, pinapana): equipable_hash is a
+        # primitive u32 the iteminfo writer round-trips byte-exact and
+        # resolves across separator/case variants (equipable_hash,
+        # _equipAbleHash) via _resolve_field_name. The schema walker
+        # cannot reach it (a preceding variable-length field has no
+        # descriptor), so every intent was skipped at import and the
+        # mod produced 0 byte changes even after the writer learned the
+        # field name. Early-accept the normalized name so the apply path
+        # reaches the writer, which round-trip-guards before committing.
+        or intent.field.replace("_", "").lower() == "equipablehash"
     ):
         return None
 

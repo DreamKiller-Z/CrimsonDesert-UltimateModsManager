@@ -15,6 +15,7 @@ from cdumm.i18n import tr
 # move them up under a real {"version": "X.Y.Z", "date": "..."} block.
 # This keeps __version__ stable until you actually cut a release.
 _UNRELEASED_NOTES: list[str] = [
+    "<b>Equipment unlock mods that edit equipable_hash now actually apply.</b> The previous fix taught the writer the field name, but the importer was still skipping every one of these edits before they reached the writer, so the mod imported with nothing to apply and came back with a '0 byte changes' result. The importer now passes these edits through. Verified on AbyssGearUnlock (all 190 edits land and the item table stays valid). Found via pinapana's retest on GitHub (#191).",
 ]
 
 CHANGELOG = [
