@@ -2525,6 +2525,78 @@ class CdummWindow(FluentWindow):
             local_mod_id, nexus_mod_id, file_id)
         self._handle_nxm_url(synth_url, intended_mod_id=local_mod_id)
 
+    # ------------------------------------------------------------------
+    # Update All — batch every outdated mod through the per-mod path
+    # ------------------------------------------------------------------
+
+    def update_all_mods(self, items, on_done=None) -> None:
+        """Sequentially update a batch of outdated mods.
+
+        ``items`` is a list of ``(local_mod_id, nexus_mod_id, file_id,
+        url)`` tuples (one per red pill). Each runs through
+        :meth:`_handle_direct_update` (download + reimport) ONE AT A
+        TIME: a poll timer fires the next only once the previous mod's
+        download AND import have both finished (the app is idle), so it
+        is robust to both the premium direct-download path and the
+        free-tier browser handover. ``on_done`` is invoked on the main
+        thread when the whole batch is finished.
+        """
+        from PySide6.QtCore import QTimer
+        self._update_all_queue = list(items)
+        self._update_all_total = len(self._update_all_queue)
+        self._update_all_index = 0
+        self._update_all_on_done = on_done
+        self._update_all_active = True
+        if getattr(self, "_update_all_timer", None) is None:
+            self._update_all_timer = QTimer(self)
+            self._update_all_timer.setInterval(1200)
+            self._update_all_timer.timeout.connect(self._update_all_tick)
+        self._update_all_timer.start()
+        # Kick the first one immediately; the timer paces the rest.
+        self._update_all_tick()
+
+    def _update_all_busy(self) -> bool:
+        """True while a download or import is still in flight."""
+        if getattr(self, "_active_worker", None) is not None:
+            return True
+        if getattr(self, "_import_queue", None):
+            return True
+        if getattr(self, "_nxm_download_banner", None) is not None:
+            return True
+        return False
+
+    def _update_all_tick(self) -> None:
+        if not getattr(self, "_update_all_active", False):
+            return
+        if self._update_all_busy():
+            return  # current mod still downloading or importing — wait
+        q = getattr(self, "_update_all_queue", None)
+        if not q:
+            self._update_all_active = False
+            t = getattr(self, "_update_all_timer", None)
+            if t is not None:
+                t.stop()
+            total = getattr(self, "_update_all_total", 0)
+            InfoBar.success(
+                title="Update All complete",
+                content=(f"Finished updating {total} mod(s). Press Apply "
+                         f"to write the changes to the game."),
+                duration=8000, position=InfoBarPosition.TOP, parent=self)
+            cb = getattr(self, "_update_all_on_done", None)
+            self._update_all_on_done = None
+            if callable(cb):
+                try:
+                    cb()
+                except Exception:
+                    logger.exception("Update All on_done callback failed")
+            return
+        mod_id, nexus_mod_id, file_id, url = q.pop(0)
+        self._update_all_index += 1
+        logger.info("Update All: starting %d/%d (mod_id=%s, nexus=%s)",
+                    self._update_all_index, self._update_all_total,
+                    mod_id, nexus_mod_id)
+        self._handle_direct_update(mod_id, nexus_mod_id, file_id, url)
+
     def _handle_nxm_url(self, url: str,
                          intended_mod_id: int | None = None) -> None:
         """Resolve an ``nxm://`` URL into a downloaded file + import queue.
@@ -7176,6 +7248,14 @@ class CdummWindow(FluentWindow):
         def _on_stderr():
             data = proc.readAllStandardError().data().decode("utf-8", errors="replace")
             if data.strip():
+                # GitHub #218: a worker actively logging to stderr is
+                # alive and working, not stalled. Large mods (e.g. "No
+                # Camera Auto Zoom Out In" routes thousands of actionchart
+                # files into one archive) spend minutes in a phase that
+                # emits stderr log lines but no structured progress
+                # message, so the progress-only watchdog false-killed
+                # them. Treat any stderr output as a liveness heartbeat.
+                _wd["last_progress_ts"] = _time.monotonic()
                 logger.debug("Worker stderr: %s", data.strip()[:500])
 
         def _on_proc_error(err):
@@ -8113,6 +8193,9 @@ class CdummWindow(FluentWindow):
                 tray.hide()
             except RuntimeError:
                 pass
+        # Stop any in-flight Update All run so its poll timer can't fire
+        # _update_all_tick against a half-destroyed window during teardown.
+        self._update_all_active = False
         # Stop timers (guard against already-deleted C++ objects, Qt may
         # have reaped children by the time closeEvent fires)
         for timer_name in (
@@ -8121,6 +8204,7 @@ class CdummWindow(FluentWindow):
             "_db_change_timer",
             "_nxm_poll_timer",
             "_nexus_update_timer",
+            "_update_all_timer",
         ):
             timer = getattr(self, timer_name, None)
             if timer is None:

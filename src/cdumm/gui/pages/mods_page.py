@@ -371,6 +371,29 @@ class ModsPage(QWidget):
             "PushButton:hover { background: #502222; }"
             "PushButton:pressed { background: #582828; }")
         select_row.addWidget(self._conflicts_btn)
+
+        # One-click "Update All" for every mod whose version pill is RED
+        # (Nexus reports a newer file). Reuses the per-mod click-to-update
+        # path (_handle_direct_update) one mod at a time via the window's
+        # sequential queue, so it is just a batched version of clicking
+        # each red pill. Hidden until at least one mod is outdated.
+        self._update_all_btn = PushButton(
+            FluentIcon.UPDATE,
+            tr("mod_list.update_all")
+            if tr("mod_list.update_all") != "mod_list.update_all"
+            else "Update All")
+        self._update_all_btn.setFixedHeight(32)
+        self._update_all_btn.setFont(_nbf)
+        self._update_all_btn.clicked.connect(self._on_update_all_clicked)
+        setCustomStyleSheet(self._update_all_btn,
+            "PushButton { background: #F0FFF4; color: #2E9E5B; border: 1px solid #B8E8C8; border-radius: 16px; padding: 0 14px; padding-bottom: 6px; }"
+            "PushButton:hover { background: #E0F8E8; }"
+            "PushButton:pressed { background: #D0F0DC; }",
+            "PushButton { background: #16301F; color: #5CD08A; border: 1px solid #285038; border-radius: 16px; padding: 0 14px; padding-bottom: 6px; }"
+            "PushButton:hover { background: #1E3C28; }"
+            "PushButton:pressed { background: #244830; }")
+        self._update_all_btn.setVisible(False)
+        select_row.addWidget(self._update_all_btn)
         left.addLayout(select_row)
 
         # Scrollable mod list area with smooth scroll animation
@@ -603,6 +626,55 @@ class ModsPage(QWidget):
         elif fallback_url:
             import webbrowser
             webbrowser.open(fallback_url)
+
+    def _on_update_all_clicked(self) -> None:
+        """Update every outdated mod in one go.
+
+        Collects the same (mod_id, nexus_mod_id, file_id, url) tuple the
+        red pill would emit for each card whose pill is RED, then hands
+        the batch to the window, which downloads + reimports them ONE AT
+        A TIME through the existing per-mod update path. Free-tier users
+        get the same per-mod browser handover, just sequentially.
+        """
+        items = []
+        for card in self._mod_cards:
+            if not getattr(card, "_has_update", False):
+                continue
+            nid = int(getattr(card, "_nexus_mod_id", 0) or 0)
+            fid = int(getattr(card, "_latest_file_id", 0) or 0)
+            url = getattr(card, "_nexus_url", "") or ""
+            if nid and fid:
+                items.append((card.mod_id, nid, fid, url))
+        if not items:
+            return
+        win = self.window()
+        if not hasattr(win, "update_all_mods"):
+            return
+        from qfluentwidgets import MessageBox
+        title = (tr("mod_list.update_all")
+                 if tr("mod_list.update_all") != "mod_list.update_all"
+                 else "Update All")
+        body = (
+            f"Update {len(items)} outdated mod(s)? CDUMM will download and "
+            f"reimport them one at a time. This may take a while and will "
+            f"reimport each mod, your enabled state, load order and folder "
+            f"groups are kept. Press Apply afterwards to write the updates "
+            f"to the game.")
+        box = MessageBox(title, body, win)
+        if not box.exec():
+            return
+        self._update_all_running = True
+        self._update_all_btn.setEnabled(False)
+        self._update_all_btn.setText(
+            tr("mod_list.update_all_running")
+            if tr("mod_list.update_all_running") != "mod_list.update_all_running"
+            else "Updating...")
+
+        def _done():
+            self._update_all_running = False
+            self._update_stats()
+
+        win.update_all_mods(items, _done)
 
     # ------------------------------------------------------------------
     # Refresh
@@ -1035,6 +1107,16 @@ class ModsPage(QWidget):
                     outdated += 1
         self._summary_bar.update_stats(total, active, pending, inactive,
                                        outdated=outdated)
+        # Show the "Update All" button only when something is outdated,
+        # with a live count, unless an update-all run is already going.
+        btn = getattr(self, "_update_all_btn", None)
+        if btn is not None and not getattr(self, "_update_all_running", False):
+            label = (tr("mod_list.update_all")
+                     if tr("mod_list.update_all") != "mod_list.update_all"
+                     else "Update All")
+            btn.setText(f"{label} ({outdated})" if outdated else label)
+            btn.setVisible(outdated > 0)
+            btn.setEnabled(outdated > 0)
 
     # ------------------------------------------------------------------
     # Search
@@ -1677,7 +1759,9 @@ class ModsPage(QWidget):
                     cfg_src = source_path
                 if not cfg_src and old_drop_name:
                     cfg_src = old_drop_name.split("||", 1)[0]
-                self._mod_manager.remove_mod(mod_id)
+                # GitHub #203: reuse the existing row instead of
+                # destroying it, so re-picking a folder variant updates
+                # the mod in place rather than making it vanish / split.
                 window = self.window()
                 window._update_priority = old_priority
                 window._update_enabled = old_enabled
@@ -1687,7 +1771,8 @@ class ModsPage(QWidget):
                     raw = old_drop_name.split("||", 1)[0]
                     from pathlib import Path as _P
                     window._original_drop_path = _P(raw)
-                window._launch_import_worker(worker_path)
+                window._launch_import_worker(
+                    worker_path, existing_mod_id=mod_id)
             self._config_panel.close_panel()
             self._folder_variant_paths = []
             return
@@ -1772,7 +1857,9 @@ class ModsPage(QWidget):
                     cfg_src = source_path
                 if not cfg_src and old_drop_name:
                     cfg_src = old_drop_name.split("||", 1)[0]
-                self._mod_manager.remove_mod(mod_id)
+                # GitHub #203: reuse the existing row (grid variant
+                # re-pick) instead of destroying it, so the mod updates
+                # in place rather than vanishing / splitting into new rows.
                 window = self.window()
                 window._update_priority = old_priority
                 window._update_enabled = old_enabled
@@ -1787,7 +1874,8 @@ class ModsPage(QWidget):
                     raw = old_drop_name.split("||", 1)[0]
                     from pathlib import Path as _P
                     window._original_drop_path = _P(raw)
-                window._launch_import_worker(worker_path)
+                window._launch_import_worker(
+                    worker_path, existing_mod_id=mod_id)
             self._config_panel.close_panel()
             self._folder_variant_paths = []
             self._folder_variant_is_grid = False
@@ -2027,7 +2115,15 @@ class ModsPage(QWidget):
                             cfg_src = source_path
                         if not cfg_src and old_drop_name:
                             cfg_src = old_drop_name.split("||", 1)[0]
-                        self._mod_manager.remove_mod(mod_id)
+                        # GitHub #203: re-picking options on an ALREADY
+                        # imported configurable mod used to remove_mod()
+                        # the row up-front and re-import with no
+                        # existing_mod_id, so the worker created a fresh
+                        # row (or several) and the original mod vanished
+                        # from the list. Reuse the existing row instead:
+                        # pass existing_mod_id so the worker updates it in
+                        # place (the same mechanism click-to-update uses),
+                        # and do NOT destroy it first.
                         window = self.window()
                         window._update_priority = old_priority
                         window._update_enabled = old_enabled
@@ -2037,7 +2133,8 @@ class ModsPage(QWidget):
                         # even though the worker only sees the picked JSON.
                         if old_drop_name:
                             window._original_drop_path = Path(old_drop_name)
-                        window._launch_import_worker(worker_path)
+                        window._launch_import_worker(
+                            worker_path, existing_mod_id=mod_id)
                     self._config_panel.close_panel()
                     self._preset_paths = []
                     return
