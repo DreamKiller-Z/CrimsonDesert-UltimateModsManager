@@ -99,6 +99,29 @@ class _UpdateDLDispatcher(QObject):
             logger.warning("update-dl dispatcher failed raised: %s", e)
 
 
+def _papgt_dir_owners(conn):
+    """Map each modded top-level directory (e.g. ``"0123"``) to the set of
+    mod names that write into it.
+
+    Used by the post-apply verification so a "Missing directory NNNN" issue
+    can name the mod that left the dangling PAPGT entry instead of the bare
+    ``PAPGT`` category tag (GitHub #225). Disabled mods are included on
+    purpose: a missing directory is almost always the directory of a mod the
+    user just disabled, whose overlay was removed while its PAPGT index entry
+    lingered, so an enabled-only query would never name it.
+    """
+    owners = {}
+    for fp, mod_name in conn.execute(
+        "SELECT DISTINCT md.file_path, m.name "
+        "FROM mod_deltas md JOIN mods m ON md.mod_id = m.id "
+        "WHERE md.file_path NOT LIKE 'meta/%'"
+    ).fetchall():
+        parts = fp.split("/")
+        if len(parts) >= 2 and parts[0].isdigit():
+            owners.setdefault(parts[0], set()).add(mod_name)
+    return owners
+
+
 def _quiet_qprocess(proc) -> None:
     """Suppress the brief console window flash when ``QProcess`` spawns
     a Windows subprocess.
@@ -6371,6 +6394,9 @@ class CdummWindow(FluentWindow):
         from cdumm.archive.hashlittle import compute_pamt_hash, compute_papgt_hash
 
         issues = []
+        # GitHub #225: map dirs -> owning mod so a 'Missing directory'
+        # issue can name the mod (the dialog promises a mod name).
+        dir_owners = _papgt_dir_owners(self._db.connection)
 
         # 1. Check PAPGT hash
         papgt_path = self._game_dir / "meta" / "0.papgt"
@@ -6400,11 +6426,13 @@ class CdummWindow(FluentWindow):
                                 issues.append(("PAPGT", f"{dir_name} PAMT hash mismatch"))
                         elif not (self._game_dir / dir_name).exists():
                             # Skip vanilla placeholder dirs (< 0036) that don't exist on disk
+                            _owners = dir_owners.get(dir_name)
+                            _src = ", ".join(sorted(_owners)) if _owners else "PAPGT"
                             try:
                                 if int(dir_name) >= 36:
-                                    issues.append(("PAPGT", f"Missing directory {dir_name}"))
+                                    issues.append((_src, f"Missing directory {dir_name}"))
                             except (ValueError, TypeError):
-                                issues.append(("PAPGT", f"Missing directory {dir_name}"))
+                                issues.append((_src, f"Missing directory {dir_name}"))
 
         # 2. Get all files modified by enabled mods
         modded_files = self._db.connection.execute(
