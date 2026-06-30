@@ -15,10 +15,18 @@ from cdumm.i18n import tr
 # move them up under a real {"version": "X.Y.Z", "date": "..."} block.
 # This keeps __version__ stable until you actually cut a release.
 _UNRELEASED_NOTES: list[str] = [
-    "<b>Format 3 mods that edit string entries now apply.</b> Mods like the Female Armor Module set string values CDUMM stores as a variable-length field (engine name <code>_buffer</code>), and those used to be skipped with a 'lands in a later phase' note. CDUMM now rewrites the string in place, located by its key, and rebuilds the table index so the file stays valid. Verified against the full vanilla string table (every record round-trips byte for byte). GitHub #224.",
 ]
 
 CHANGELOG = [
+    {
+        "version": "3.4.2",
+        "date": "2026-06-30",
+        "notes": [
+            "<b>Mods that edit in-game text now apply.</b> Some mods (like the Female Armor Module) change string entries CDUMM stores as a variable-length field, and those used to be skipped with a 'comes in a later update' note. CDUMM now rewrites the text in place, found by its key, and rebuilds the table index so the file stays valid. Checked against the whole vanilla string table, where every entry comes back byte for byte identical. Found via lurkser, pinapana and woowoots on GitHub (#224).",
+            "<b>Disabling a mod no longer leaves a 'Missing directory' error.</b> Turning off a mod that added its own game folder used to delete that folder while the master index still pointed at it, so the post-apply check reported a missing directory and the only way out was to re-verify the game files. CDUMM now keeps the index in step with what is actually on disk after the mod's files are removed, and the message names the mod responsible. Found via falobos76 on GitHub (#225).",
+            "Thanks to AgentKush, who contributed the change that names the mod behind a 'Missing directory' notice (#231) and a clearer message for mods that edit variable-length text fields (#227), plus build-system fixes.",
+        ],
+    },
     {
         "version": "3.4.1",
         "date": "2026-06-23",
