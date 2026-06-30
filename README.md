@@ -17,7 +17,7 @@
 
 ## What's New
 
-CDUMM ships frequent updates. For the complete per-version history, see the [Releases](https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager/releases) page (the in-app updater also shows release notes after each update). Recent progress, newest first:
+CDUMM ships frequent updates. The complete version history — every release back to the first commit — is in **[CHANGELOG.md](CHANGELOG.md)**; the [Releases](https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager/releases) page has full notes and downloads (the in-app updater shows them too). Recent highlights, newest first:
 
 ### v3.4 series — game 1.12 support & one-click updates
 
@@ -31,7 +31,18 @@ CDUMM ships frequent updates. For the complete per-version history, see the [Rel
 - **v3.3.15 – v3.3.18** — _May 29–June 8, 2026_ — The self-update download-complete freeze is properly fixed (work moved back to the main thread, plus a `.old` exe swap so Windows can replace the running app). Downloads and update checks work again after the 1.09 patch (certifi trust store). Character-creator mods now ask which race / gender to install first, recovery no longer loops after a game update, characterinfo mesh / model fields apply, and silent import failures are surfaced instead of counting as success. (#170/#172, #190, #163, #192, #193, #165)
 - **v3.3.0 – v3.3.14** — _May 10–27, 2026_ — Stale-overlay cleanup (#141), `gamedata/` wrapper imports (#146), a 4 GB texture-pack guard (#148), the hide-on-launch toggle, preset persistence, and a steady run of apply-correctness fixes.
 
-Older releases — **v3.1–v3.2** (NexusMods integration, one-click game-update recovery, and the first Format 3 field-name mod support) — are on the [Releases](https://github.com/faisalkindi/CrimsonDesert-UltimateModsManager/releases) page.
+### Earlier highlights (v3.2)
+
+- **Buff mods now apply.** Field-name `.field.json` mods that target `buffinfo.pabgb` (NoCooldownForALLItems, Double Resource Buff, etc.) used to import cleanly and then quietly do nothing in game. CDUMM now decodes the actual on-disk layout instead of relying on a structurally wrong schema, and a 4185-intent test mod goes from 0% applying to 100%. If you installed any buffinfo `.field.json` mod on an older build, run Settings > Fix Everything before re-applying because the old code was silently corrupting unrelated bytes.
+- **SKIPPED badge surfaces partial-apply state (v3.2.9 series).** When a game patch drifts a mod's bytes off, the card shows a yellow pill with the dropped patch count and a tooltip naming each affected file. Right-click > Reimport from source clears it. Active and SKIPPED never both show; one mod is either fully active or fully off.
+- **Click-to-update no longer creates duplicate cards on Format 3 mods.** Two import paths were dropping the existing-mod-id when forwarding to the Format 3 importer, so updates inserted a fresh row instead of replacing the original.
+- **Three texture mods touching the same file no longer hang the loading screen.** v3.2.8 byte-level merging was firing on DDS textures and producing corrupt files the GPU rejected. Texture / audio / image mods now fall back to last-wins like before.
+- **Barber Unlocked and similar OG_ XML mods apply.** The OG_ XML import was writing delta files without the right header, apply hit "corrupt entry delta" and silently no-opped. Re-importing rewrote the same broken file.
+- **"Vanilla backup missing" warning no longer loops forever after Fix Everything.** The self-heal path now creates the backup the first time it succeeds, so subsequent applies skip the warn entirely.
+- **Revert to Vanilla no longer freezes around 90% on installs with many archives.** Per-dir progress, faster hash-stream comparison for large files, single locked file logs and continues instead of aborting the whole revert.
+- **Xbox installs at custom paths now launch correctly.** Detection also checks for the Microsoft publisher hash and the canonical Content/packages layout token, so installs moved off the default `C:\XboxGames\` path use the right launch URI.
+
+The complete version history — every release back to the first commit — is in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ---
 
