@@ -305,6 +305,57 @@ def hexdump(data: bytes, limit: int = 4096) -> str:
     return "\n".join(out)
 
 
+def _lz4_stream_decode(src: bytes, pos: int, want: int) -> bytes:
+    """Decode a continuous LZ4-block byte stream from ``src[pos:]`` until
+    ``want`` output bytes are produced. Raises on malformed / truncated
+    input. Used to recover the top mip of a compressed multi-mip DDS."""
+    out = bytearray()
+    while len(out) < want:
+        tok = src[pos]; pos += 1
+        lit = tok >> 4
+        if lit == 15:
+            while True:
+                bb = src[pos]; pos += 1; lit += bb
+                if bb != 255:
+                    break
+        out += src[pos:pos + lit]; pos += lit
+        if len(out) >= want:
+            break
+        off = src[pos] | (src[pos + 1] << 8); pos += 2
+        ml = tok & 15
+        if ml == 15:
+            while True:
+                bb = src[pos]; pos += 1; ml += bb
+                if bb != 255:
+                    break
+        ml += 4
+        st = len(out) - off
+        for i in range(ml):
+            out.append(out[st + i])
+    return bytes(out[:want])
+
+
+def _dds_top_mip_dds(data: bytes) -> bytes | None:
+    """Recover a previewable DDS from a compressed multi-mip texture whose
+    body is a continuous LZ4 stream (the game's type-1 layout that whole-
+    buffer / single-block LZ4 can't open). Decodes just the top mip
+    (``dwPitchOrLinearSize`` bytes) and returns a single-mip DDS a standard
+    decoder opens, or None if it doesn't apply / decode."""
+    if data[:4] != b"DDS " or len(data) < 128:
+        return None
+    hdr_size = 148 if data[84:88] == b"DX10" else 128
+    linear = int.from_bytes(data[20:24], "little")   # mip-0 size in bytes
+    if linear <= 0 or linear > 64 * 1024 * 1024:
+        return None
+    try:
+        mip0 = _lz4_stream_decode(data, hdr_size, linear)
+    except Exception:  # noqa: BLE001 — not a continuous-LZ4 body
+        return None
+    hdr = bytearray(data[:hdr_size])
+    hdr[28:32] = (1).to_bytes(4, "little")           # dwMipMapCount = 1
+    return bytes(hdr) + mip0
+
+
 _IMAGE_EXTS = (".dds", ".png", ".jpg", ".jpeg", ".bmp", ".tga")
 
 
@@ -325,11 +376,24 @@ def decode_image(data: bytes, path: str = "", max_dim: int = 1024):
     except Exception:  # noqa: BLE001 — Pillow is optional
         return None
     import io
+    im = None
     try:
         im = Image.open(io.BytesIO(data))
         im.load()
     except Exception:  # noqa: BLE001 — unsupported codec / not an image
-        return None
+        im = None
+    if im is None:
+        # Compressed multi-mip DDS: the body is a continuous LZ4 stream a
+        # standard decoder can't open. Recover just the top mip (full-res)
+        # and retry — all a preview needs.
+        rebuilt = _dds_top_mip_dds(data)
+        if rebuilt is None:
+            return None
+        try:
+            im = Image.open(io.BytesIO(rebuilt))
+            im.load()
+        except Exception:  # noqa: BLE001
+            return None
     ow, oh = im.size
     if im.mode not in ("RGB", "RGBA", "L", "LA"):
         try:

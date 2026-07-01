@@ -278,3 +278,29 @@ def test_dds_split_decompress_roundtrips():
 def test_dds_split_decompress_rejects_non_dds():
     assert gi._dds_split_decompress(b"\x00" * 200, 500) is None       # no magic
     assert gi._dds_split_decompress(b"DDS " + bytes(60), 500) is None  # too short
+
+
+def test_dds_top_mip_recovers_from_lz4_stream():
+    import pytest
+    pytest.importorskip("lz4")
+    from cdumm.archive import paz_crypto
+    mip0 = bytes(range(256)) * 4          # 1024 bytes of top-mip "pixels"
+    tail = b"\xAB" * 4000                 # stands in for the lower mip chain
+    body = paz_crypto.lz4_compress(mip0 + tail)   # continuous LZ4 body
+    hdr = bytearray(b"DDS " + bytes(124))
+    hdr[20:24] = len(mip0).to_bytes(4, "little")  # dwPitchOrLinearSize = mip0
+    hdr[84:88] = b"DXT1"
+    out = gi._dds_top_mip_dds(bytes(hdr) + body)
+    assert out is not None
+    assert out[:4] == b"DDS "
+    assert out[28:32] == (1).to_bytes(4, "little")     # mipcount forced to 1
+    assert out[128:128 + len(mip0)] == mip0            # top mip recovered
+
+
+def test_lz4_stream_decode_partial():
+    import pytest
+    pytest.importorskip("lz4")
+    from cdumm.archive import paz_crypto
+    full = b"HELLO_WORLD_" * 500
+    comp = paz_crypto.lz4_compress(full)
+    assert gi._lz4_stream_decode(comp, 0, 100) == full[:100]   # stop early
