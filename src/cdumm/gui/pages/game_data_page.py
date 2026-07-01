@@ -16,9 +16,9 @@ import subprocess
 import tempfile
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QSizePolicy,
-                               QSplitter, QTableWidgetItem, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QHeaderView,
+                               QSizePolicy, QSplitter, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from cdumm.engine import game_index
 from cdumm.gui.pages.tool_page import ToolPageBase
@@ -153,14 +153,17 @@ class GameDataPage(ToolPageBase):
         _tf = self._table.font()
         _tf.setPixelSize(15)
         self._table.setFont(_tf)
-        _hf = self._table.horizontalHeader().font()
+        _hdr = self._table.horizontalHeader()
+        _hf = _hdr.font()
         _hf.setPixelSize(15)
-        self._table.horizontalHeader().setFont(_hf)
+        _hdr.setFont(_hf)
+        # Path absorbs the slack; the other three size to their content. This
+        # keeps the columns spanning the full table width so the vertical
+        # scrollbar hugs the last column instead of floating far to its right.
+        _hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for _c in (1, 2, 3):
+            _hdr.setSectionResizeMode(_c, QHeaderView.ResizeMode.ResizeToContents)
         self._table.verticalHeader().setDefaultSectionSize(36)
-        try:
-            self._table.setColumnWidth(0, 360)
-        except Exception:  # noqa: BLE001
-            pass
         self._table.itemSelectionChanged.connect(self._on_asset_selected)
         split.addWidget(self._table)
 
