@@ -391,3 +391,22 @@ def test_decode_audio_rejects_non_audio():
 def test_find_vgmstream_never_raises():
     r = gi.find_vgmstream()          # str path if bundled/on PATH, else None
     assert r is None or isinstance(r, str)
+
+
+def test_pick_vgmstream_asset_by_os():
+    # Real asset names from the vgmstream GitHub release (r2117): all .zip,
+    # no "cli" suffix, plus non-OS artifacts that must be ignored.
+    assets = [
+        {"name": "foo_input_vgmstream.fb2k-component", "browser_download_url": "u0"},
+        {"name": "vgmstream-linux.zip", "browser_download_url": "u1"},
+        {"name": "vgmstream-mac.zip", "browser_download_url": "u2"},
+        {"name": "vgmstream-wasm.zip", "browser_download_url": "u3"},
+        {"name": "vgmstream-win.zip", "browser_download_url": "u4"},
+        {"name": "vgmstream-win64.zip", "browser_download_url": "u5"},
+    ]
+    pick = gi._pick_vgmstream_asset
+    assert pick(assets, "Windows", "AMD64")["name"] == "vgmstream-win64.zip"
+    assert pick(assets, "Linux", "x86_64")["name"] == "vgmstream-linux.zip"
+    assert pick(assets, "Darwin", "arm64")["name"] == "vgmstream-mac.zip"
+    assert pick([], "Windows", "AMD64") is None      # nothing published
+    assert pick(assets, "Plan9", "") is None          # unknown OS

@@ -5,7 +5,12 @@ The game's sounds (.wem / .bnk) are Wwise Vorbis, which Windows cannot play
 directly. The Game Data tab uses vgmstream to decode them to standard WAV for
 the in-app "Play" button and "Export as WAV".
 
-To enable audio playback, drop the vgmstream CLI here:
+Easiest: in the Game Data tab, click an audio (.wem) asset and press
+"⬇ Enable audio playback" — it auto-detects your OS, downloads the correct
+latest vgmstream build from the official GitHub release, and installs it here
+for you. The rest of this file is the manual alternative.
+
+To enable audio playback manually, drop the vgmstream CLI here:
 
     src/cdumm/tools/vgmstream/vgmstream-cli.exe
 

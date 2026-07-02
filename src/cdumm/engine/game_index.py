@@ -411,14 +411,106 @@ def decode_audio(data: bytes, path: str = "") -> dict | None:
 
 def find_vgmstream() -> str | None:
     """Locate the vgmstream CLI used to decode Wwise audio to WAV: the copy
-    bundled under ``cdumm/tools/vgmstream/`` first, then anything on PATH."""
+    under ``cdumm/tools/vgmstream/`` (searched recursively, since release
+    archives may nest it in a subfolder), then anything on PATH."""
     import shutil
+    names = ("vgmstream-cli.exe", "vgmstream-cli", "test.exe")
     pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # …/cdumm
-    for name in ("vgmstream-cli.exe", "vgmstream-cli", "test.exe"):
-        cand = os.path.join(pkg, "tools", "vgmstream", name)
+    base = os.path.join(pkg, "tools", "vgmstream")
+    for name in names:
+        cand = os.path.join(base, name)
         if os.path.exists(cand):
             return cand
+    if os.path.isdir(base):
+        for root, _dirs, files in os.walk(base):
+            for name in names:
+                if name in files:
+                    return os.path.join(root, name)
     return shutil.which("vgmstream-cli") or shutil.which("vgmstream_cli")
+
+
+VGMSTREAM_RELEASES_API = \
+    "https://api.github.com/repos/vgmstream/vgmstream/releases/latest"
+
+
+def _pick_vgmstream_asset(assets: list, system: str,
+                          machine: str = "") -> dict | None:
+    """Pick the right release archive for this OS from a GitHub 'assets' list
+    (each a dict with 'name' / 'browser_download_url'). Pure and testable."""
+    system = (system or "").lower()
+    pairs = [(a, str(a.get("name", "")).lower()) for a in assets]
+
+    def find(*must):
+        for a, n in pairs:
+            if (n.endswith((".zip", ".tar.gz", ".tgz"))
+                    and all(m in n for m in must)):
+                return a
+        return None
+    if system.startswith("win"):
+        return find("win64") or find("win")
+    if system == "linux":
+        return find("linux", "cli") or find("linux")
+    if system in ("darwin", "mac"):
+        return find("mac", "cli") or find("mac")
+    return None
+
+
+def download_vgmstream(dest_dir: str, *, timeout: int = 90) -> tuple:
+    """Download the latest vgmstream CLI for this OS from the OFFICIAL
+    vgmstream GitHub releases and extract it into ``dest_dir``. Returns
+    ``(ok, message)`` — message is the version tag on success, else an error.
+    Network + archive extraction only; nothing is executed here."""
+    import io
+    import json
+    import platform
+    import tarfile
+    import urllib.request
+    import zipfile
+    os.makedirs(dest_dir, exist_ok=True)
+
+    def _get(url, as_json=False):
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "CDUMM",
+                          "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r) if as_json else r.read()
+
+    try:
+        rel = _get(VGMSTREAM_RELEASES_API, as_json=True)
+    except Exception as ex:  # noqa: BLE001
+        return False, f"Could not reach GitHub: {ex}"
+    asset = _pick_vgmstream_asset(
+        rel.get("assets", []), platform.system(), platform.machine())
+    if not asset:
+        return False, f"No vgmstream build published for {platform.system()}."
+    url = str(asset.get("browser_download_url", ""))
+    if "github.com/vgmstream/vgmstream" not in url:
+        return False, "Refusing a non-official download URL."
+    try:
+        blob = _get(url)
+    except Exception as ex:  # noqa: BLE001
+        return False, f"Download failed: {ex}"
+    name = str(asset.get("name", "")).lower()
+    try:
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                z.extractall(dest_dir)
+        elif name.endswith((".tar.gz", ".tgz")):
+            with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as t:
+                t.extractall(dest_dir, filter="data")
+        else:
+            return False, f"Unknown archive type: {asset.get('name')}"
+    except Exception as ex:  # noqa: BLE001
+        return False, f"Extract failed: {ex}"
+    exe = find_vgmstream()
+    if not exe:
+        return False, "Extracted, but vgmstream-cli wasn't in the archive."
+    if not exe.endswith(".exe"):
+        try:
+            os.chmod(exe, 0o755)
+        except OSError:
+            pass
+    return True, str(rel.get("tag_name", "latest"))
 
 
 def convert_to_wav(data: bytes, out_wav: str) -> bool:

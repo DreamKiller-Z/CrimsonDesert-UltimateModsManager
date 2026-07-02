@@ -233,6 +233,24 @@ class _PreviewWorker(QObject):
                        text=game_index.hexdump(data, limit=self._hex_cap))
 
 
+class _VgmDownloadWorker(QObject):
+    """Downloads + installs the right vgmstream build off the UI thread so the
+    one-click 'Enable audio playback' can't freeze the app."""
+
+    done = Signal(bool, str)
+
+    def __init__(self, dest_dir: str):
+        super().__init__()
+        self._dest = dest_dir
+
+    def run(self) -> None:
+        try:
+            ok, msg = game_index.download_vgmstream(self._dest)
+        except Exception as ex:  # noqa: BLE001
+            ok, msg = False, str(ex)
+        self.done.emit(ok, msg)
+
+
 class _Texture3DView(QDialog):
     """Pop-up 3D material preview: the selected texture on a flat plane,
     sphere, or cube. Built with Qt3D, constructed lazily (Qt3D is only
@@ -559,6 +577,13 @@ class GameDataPage(ToolPageBase):
         self._pv_export_btn.setVisible(False)
         self._pv_export_btn.clicked.connect(self._on_export_wav)
         pv.addWidget(self._pv_export_btn)
+
+        # One-click "get the right vgmstream for my OS" — only shown for audio
+        # when vgmstream isn't found yet.
+        self._pv_getvgm_btn = PushButton("⬇  Enable audio playback", pane)
+        self._pv_getvgm_btn.setVisible(False)
+        self._pv_getvgm_btn.clicked.connect(self._on_get_vgmstream)
+        pv.addWidget(self._pv_getvgm_btn)
 
         self._pv_extract = PushButton("Extract raw file…", pane)
         self._pv_extract.setEnabled(False)
@@ -897,6 +922,7 @@ class GameDataPage(ToolPageBase):
         self._pv_3d_btn.setVisible(False)
         self._pv_play_btn.setVisible(False)
         self._pv_export_btn.setVisible(False)
+        self._pv_getvgm_btn.setVisible(False)
         self._pv_text.setVisible(True)
         self._pv_text.setLineWrapMode(
             self._pv_text.LineWrapMode.WidgetWidth if wrap
@@ -954,12 +980,14 @@ class GameDataPage(ToolPageBase):
         self._pv_play_btn.setEnabled(playable)
         self._pv_export_btn.setVisible(True)
         self._pv_export_btn.setEnabled(playable)
+        self._pv_getvgm_btn.setVisible(not has_vgm)   # one-click auto-install
 
     def _show_image(self, png: bytes) -> None:
         self._pv_text.setVisible(False)
         self._pv_grid.setVisible(False)
         self._pv_play_btn.setVisible(False)
         self._pv_export_btn.setVisible(False)
+        self._pv_getvgm_btn.setVisible(False)
         self._pv_img_scroll.setVisible(True)
         self._pv_qimage = QImage.fromData(png, "PNG") if png else None
         self._pv_3d_btn.setVisible(
@@ -981,6 +1009,7 @@ class GameDataPage(ToolPageBase):
         self._pv_3d_btn.setVisible(False)
         self._pv_play_btn.setVisible(False)
         self._pv_export_btn.setVisible(False)
+        self._pv_getvgm_btn.setVisible(False)
         self._pv_grid.setVisible(True)
         self._pv_grid.clear()
         self._pv_grid.setColumnCount(len(cols))
@@ -1112,3 +1141,37 @@ class GameDataPage(ToolPageBase):
                 os.unlink(wav)
             except OSError:
                 pass
+
+    def _on_get_vgmstream(self) -> None:
+        """One-click: download the right vgmstream build for this OS from the
+        official GitHub releases and install it into the app's tools folder."""
+        pkg = os.path.dirname(
+            os.path.dirname(os.path.abspath(game_index.__file__)))  # …/cdumm
+        dest = os.path.join(pkg, "tools", "vgmstream")
+        self._pv_getvgm_btn.setEnabled(False)
+        self._pv_getvgm_btn.setText("⬇  Downloading vgmstream…")
+        self._set_status("Downloading vgmstream from GitHub…", "#2E7D32")
+        th = QThread(self)
+        w = _VgmDownloadWorker(dest)
+        w.moveToThread(th)
+        th.started.connect(w.run)
+        w.done.connect(self._on_vgm_downloaded)
+        w.done.connect(th.quit)
+        w.done.connect(w.deleteLater)
+        th.finished.connect(th.deleteLater)
+        job = (th, w)
+        self._pv_jobs.append(job)
+        th.finished.connect(
+            lambda job=job: job in self._pv_jobs and self._pv_jobs.remove(job))
+        th.start()
+
+    def _on_vgm_downloaded(self, ok: bool, msg: str) -> None:
+        self._pv_getvgm_btn.setEnabled(True)
+        self._pv_getvgm_btn.setText("⬇  Enable audio playback")
+        if ok:
+            self._set_status(
+                f"vgmstream {msg} installed — audio playback enabled.",
+                "#2E7D32")
+            self._on_asset_selected()      # re-preview → Play/Export enable
+        else:
+            self._set_status(f"vgmstream setup failed: {msg}", "#BF616A")
