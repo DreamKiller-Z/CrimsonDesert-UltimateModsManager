@@ -18,8 +18,10 @@ pytest.importorskip("PySide6")
 pytest.importorskip("qfluentwidgets")
 
 
-def _schema(*names):
-    return SimpleNamespace(fields=[SimpleNamespace(name=n) for n in names])
+def _schema(*names, verified=None):
+    return SimpleNamespace(
+        fields=[SimpleNamespace(name=n) for n in names],
+        verified_fields=verified)
 
 
 def test_shape_records_dedupes_key_and_name_columns():
@@ -62,3 +64,37 @@ def test_shape_records_position_column():
     # no positions → no extra column
     cols2, _r, _t, _h2 = _shape_records(records, schema)
     assert "world pos (X, Y, Z)" not in cols2
+
+
+def test_shape_records_verified_only_masks_unverified_fields():
+    """A hand-curated table shows only validated fields; the rest render
+    ``(unverified)`` instead of a possibly-wrong value, and unverified
+    columns don't drag the health score."""
+    from cdumm.gui.pages.game_data_page import _shape_records
+    schema = _schema("_increasePrice", "_isBlocked", "_useTargetPrice",
+                     verified=frozenset({"_increasePrice"}))
+    records = {
+        256: {"_key": 256, "_name": "", "_increasePrice": 100,
+              "_isBlocked": 0, "_useTargetPrice": 0},
+        262: {"_key": 262, "_name": "", "_increasePrice": 1500,
+              "_isBlocked": 0, "_useTargetPrice": 1},
+    }
+    cols, rows, _total, health = _shape_records(records, schema)
+    ci = {c: i for i, c in enumerate(cols)}
+    # verified field shows its real value
+    assert rows[0][ci["_increasePrice"]] == "100"
+    assert rows[1][ci["_increasePrice"]] == "1500"
+    # unverified fields are masked, never shown as a decoded guess
+    assert rows[0][ci["_isBlocked"]] == "(unverified)"
+    assert rows[0][ci["_useTargetPrice"]] == "(unverified)"
+    # only the (varying) verified field is scored → healthy
+    assert health == 0.0
+
+
+def test_shape_records_verified_none_shows_all_fields():
+    """Backward compat: verified_fields=None → every field decoded as before."""
+    from cdumm.gui.pages.game_data_page import _shape_records
+    schema = _schema("_a", "_b", verified=None)
+    records = {1: {"_key": 1, "_name": "x", "_a": 7, "_b": 9}}
+    _cols, rows, _total, _h = _shape_records(records, schema)
+    assert rows[0][-2:] == ["7", "9"]         # no masking anywhere

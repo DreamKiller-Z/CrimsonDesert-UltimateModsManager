@@ -126,6 +126,16 @@ def _shape_records(records: dict, schema, positions: dict | None = None
     # (e.g. sequencerspawninfo) also list _key/_name among their schema
     # fields, which would render a redundant duplicate column — drop those.
     field_names = [f for f in field_names if f not in ("_key", "_name")]
+    # Verified-only gate: for a hand-curated table, only fields the author
+    # validated against real record data are shown decoded; the rest render
+    # `(unverified)` so a guessed byte never masquerades as fact.
+    verified = getattr(schema, "verified_fields", None) if schema else None
+
+    def _fieldval(k, c):
+        if verified is not None and c not in verified:
+            return "(unverified)"
+        return _cell(records[k].get(c))
+
     pos_col = "world pos (X, Y, Z)"
     cols = ["_key", "_name"] + ([pos_col] if positions else []) + field_names
     keys = sorted(records)[:_GRID_ROW_CAP]
@@ -139,12 +149,15 @@ def _shape_records(records: dict, schema, positions: dict | None = None
         row = [_cell(records[k].get("_key")), _cell(records[k].get("_name"))]
         if positions:
             row.append(_posval(k))
-        row += [_cell(records[k].get(c)) for c in field_names]
+        row += [_fieldval(k, c) for c in field_names]
         rows.append(row)
 
     suspect = 0
+    # Unverified fields are intentionally not decoded — exclude them from the
+    # health score so a curated table isn't penalised for hiding guesses.
+    scored_fields = ([f for f in field_names if verified is None or f in verified])
     sample = keys[:60]
-    for fn in field_names:
+    for fn in scored_fields:
         vals = [records[k].get(fn) for k in sample]
         sv = [str(v) for v in vals]
         const = len(set(sv)) == 1
@@ -159,7 +172,7 @@ def _shape_records(records: dict, schema, positions: dict | None = None
             pass
         if const or zero or seq:
             suspect += 1
-    health = (suspect / len(field_names)) if field_names else 0.0
+    health = (suspect / len(scored_fields)) if scored_fields else 0.0
     return cols, rows, len(records), health
 
 
