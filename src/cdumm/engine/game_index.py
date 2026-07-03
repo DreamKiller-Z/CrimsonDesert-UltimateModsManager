@@ -128,8 +128,11 @@ def write_stats(con: sqlite3.Connection, **extra: Any) -> dict:
     total = con.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
     archives = con.execute(
         "SELECT COUNT(DISTINCT archive) FROM assets").fetchone()[0]
+    # One data table == one .pabgb blob (+ its .pabgh key index). Count the
+    # blobs only, so the paired header file isn't tallied as a second table.
     distinct = con.execute(
-        "SELECT COUNT(DISTINCT name) FROM data_tables").fetchone()[0]
+        "SELECT COUNT(DISTINCT name) FROM data_tables "
+        "WHERE name LIKE '%.pabgb'").fetchone()[0]
     stats: dict[str, Any] = {
         "assets_total": total,
         "archives": archives,

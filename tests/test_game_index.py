@@ -134,7 +134,7 @@ def test_build_index_end_to_end(tmp_path):
 
     assert stats["assets_total"] == 4
     assert stats["archives"] == 2
-    assert stats["data_table_distinct"] == 2      # iteminfo.pabgb + .pabgh
+    assert stats["data_table_distinct"] == 1      # one table (iteminfo); .pabgh not double-counted
     assert sorted(seen) == [("0008", 3), ("0014", 1)]
 
     con = sqlite3.connect(str(out))
