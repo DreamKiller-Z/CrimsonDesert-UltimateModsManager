@@ -146,6 +146,39 @@ class SettingsPage(SmoothScrollArea):
         self._lang_card.hBoxLayout.addSpacing(16)
         self._personal_group.addSettingCard(self._lang_card)
 
+        # Accent colour card — swatch + "Change" button opening a colour picker
+        self._accent_card = SettingCard(
+            FluentIcon.PALETTE, tr("settings.accent_color"),
+            tr("settings.accent_color_desc"),
+            self._personal_group,
+        )
+        self._accent_swatch = QWidget(self._accent_card)
+        self._accent_swatch.setFixedSize(22, 22)
+        self._accent_btn = PushButton(tr("settings.accent_color_pick"))
+        self._accent_btn.setFixedWidth(110)
+        self._accent_btn.clicked.connect(self._on_pick_accent)
+        self._accent_card.hBoxLayout.addWidget(self._accent_swatch, 0, Qt.AlignmentFlag.AlignRight)
+        self._accent_card.hBoxLayout.addSpacing(10)
+        self._accent_card.hBoxLayout.addWidget(self._accent_btn, 0, Qt.AlignmentFlag.AlignRight)
+        self._accent_card.hBoxLayout.addSpacing(16)
+        self._personal_group.addSettingCard(self._accent_card)
+
+        # Interface zoom card — scales the whole UI (accessibility). Qt
+        # applies the scale factor at startup, so a restart is required.
+        self._zoom_card = SettingCard(
+            FluentIcon.ZOOM, tr("settings.interface_zoom"),
+            tr("settings.interface_zoom_desc"),
+            self._personal_group,
+        )
+        self._zoom_combo = ComboBox()
+        self._zoom_combo.addItems(["100%", "110%", "125%", "150%", "175%", "200%"])
+        self._zoom_combo.setFixedWidth(140)
+        self._zoom_combo.setStyleSheet("ComboBox { text-align: center; }")
+        self._zoom_combo.currentIndexChanged.connect(self._on_zoom_changed)
+        self._zoom_card.hBoxLayout.addWidget(self._zoom_combo, 0, Qt.AlignmentFlag.AlignRight)
+        self._zoom_card.hBoxLayout.addSpacing(16)
+        self._personal_group.addSettingCard(self._zoom_card)
+
         self._layout.addWidget(self._personal_group)
 
         # ── Game group ────────────────────────────────────────────
@@ -706,6 +739,17 @@ class SettingsPage(SmoothScrollArea):
         self._theme_combo.setCurrentIndex(theme_index)
         self._theme_combo.blockSignals(False)
 
+        # Accent colour swatch
+        self._set_accent_swatch(self._config.get("accent_color") or "#2878D0")
+
+        # Interface zoom
+        zoom = self._config.get("interface_zoom") or "1.0"
+        zoom_factors = ("1.0", "1.1", "1.25", "1.5", "1.75", "2.0")
+        self._zoom_combo.blockSignals(True)
+        self._zoom_combo.setCurrentIndex(
+            zoom_factors.index(zoom) if zoom in zoom_factors else 0)
+        self._zoom_combo.blockSignals(False)
+
         # Language — match by code list
         saved_lang = self._config.get("language") or "en"
         self._lang_combo.blockSignals(True)
@@ -810,6 +854,47 @@ class SettingsPage(SmoothScrollArea):
         # Re-apply custom styles wiped by qfluentwidgets updateStyleSheet()
         self._reapply_custom_styles()
         logger.info("Theme changed to %s", theme)
+
+    def _set_accent_swatch(self, hexstr: str) -> None:
+        """Paint the little colour preview square next to the button."""
+        self._accent_swatch.setStyleSheet(
+            f"background-color: {hexstr}; border-radius: 4px; "
+            "border: 1px solid rgba(127,127,127,0.5);")
+
+    def _on_pick_accent(self) -> None:
+        """Open a colour picker; apply + persist the chosen accent colour."""
+        from qfluentwidgets import ColorDialog, setThemeColor
+        from PySide6.QtGui import QColor
+        current = (self._config.get("accent_color") if self._config else None) or "#2878D0"
+        dlg = ColorDialog(QColor(current), tr("settings.accent_color"),
+                          self.window(), enableAlpha=False)
+
+        def _apply(color: QColor) -> None:
+            hexstr = color.name()
+            if self._config:
+                self._config.set("accent_color", hexstr)
+            setThemeColor(hexstr)
+            self._set_accent_swatch(hexstr)
+            self._reapply_custom_styles()
+            logger.info("Accent colour changed to %s", hexstr)
+
+        dlg.colorChanged.connect(_apply)
+        dlg.exec()
+
+    def _on_zoom_changed(self, index: int) -> None:
+        """Persist the interface zoom. Qt applies the DPI scale at
+        startup, so the change takes effect on the next launch."""
+        factors = ("1.0", "1.1", "1.25", "1.5", "1.75", "2.0")
+        factor = factors[index] if 0 <= index < len(factors) else "1.0"
+        if self._config:
+            self._config.set("interface_zoom", factor)
+        from cdumm.gui.ui_scale import write_ui_scale
+        write_ui_scale(factor)
+        InfoBar.warning(
+            tr("settings.restart_required_title"),
+            tr("settings.restart_required"),
+            duration=6000, position=InfoBarPosition.TOP, parent=self.window())
+        logger.info("Interface zoom set to %s (restart required)", factor)
 
     def _reapply_custom_styles(self) -> None:
         """Re-apply custom widget styles after qfluentwidgets theme update wipes them."""
