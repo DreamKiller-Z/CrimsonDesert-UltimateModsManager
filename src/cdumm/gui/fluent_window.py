@@ -887,6 +887,7 @@ from cdumm.gui.pages.tool_page import (  # noqa: E402
     InspectModPage, FixEverythingPage, RescanPage,
 )
 from cdumm.gui.pages.reshade_page import ReshadePage  # noqa: E402
+from cdumm.gui.pages.game_data_page import GameDataPage  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +903,15 @@ class CdummWindow(FluentWindow):
         startup_context: dict | None = None,
     ) -> None:
         super().__init__()
+
+        # Disable the Windows 11 Mica backdrop. Mica tints the window from the
+        # desktop wallpaper and — because Windows dims inactive windows — makes
+        # the whole background visibly change every time the app gains or loses
+        # focus. Turning it off gives one steady, focus-independent background.
+        try:
+            self.setMicaEffectEnabled(False)
+        except Exception:  # noqa: BLE001 — older qfluentwidgets / non-Windows
+            pass
 
         # ── Window chrome ─────────────────────────────────────────────
         self.setWindowTitle(tr("app.name_short") + " v" + __version__)
@@ -1216,6 +1226,10 @@ class CdummWindow(FluentWindow):
         self.rescan_page.set_managers(**tool_kwargs)
         self.rescan_page.rescan_requested.connect(self._on_refresh_snapshot)
 
+        self.game_data_page = GameDataPage(self)
+        self.game_data_page.set_managers(
+            **tool_kwargs, app_data_dir=getattr(self, "_app_data_dir", None))
+
         self.reshade_page = ReshadePage(self)
         self.reshade_page.set_managers(db=self._db, game_dir=self._game_dir)
 
@@ -1290,6 +1304,10 @@ class CdummWindow(FluentWindow):
         )
         self.addSubInterface(
             self.rescan_page, FluentIcon.SYNC, tr("nav.rescan"),
+            position=NavigationItemPosition.SCROLL,
+        )
+        self.addSubInterface(
+            self.game_data_page, FluentIcon.ZOOM_IN, "Game Data",
             position=NavigationItemPosition.SCROLL,
         )
         self.addSubInterface(
@@ -6795,7 +6813,8 @@ class CdummWindow(FluentWindow):
             activity_log=self._activity_log if hasattr(self, '_activity_log') else None,
         )
         for page_name in ('verify_state_page', 'check_mods_page', 'find_culprit_page',
-                          'inspect_mod_page', 'fix_everything_page', 'rescan_page'):
+                          'inspect_mod_page', 'fix_everything_page', 'rescan_page',
+                          'game_data_page'):
             page = getattr(self, page_name, None)
             if page:
                 page.set_managers(**tool_kwargs)
