@@ -63,7 +63,22 @@ gear variant.
 - `new_key` must be unused and fit the table's key width; a collision is
   refused.
 - The copy is byte-identical to the source except your patches.
-- Patches target **verified scalar fields** (same rule as `set`).
+- Patches target **verified scalar fields** (same rule as `set`), and on
+  `iteminfo` also **`gear_stat[...]`** — so you can clone a weapon or piece
+  of armour and change its damage/defense on the copy:
+
+```json
+{
+  "op": "clone_record",
+  "source_key": 50003,
+  "new_key": 50003001,
+  "new_name": "Sharpened Blade",
+  "patches": [ { "field": "gear_stat[1000000]", "new": 999999 } ]
+}
+```
+
+  A `gear_stat[...]` edit is a byte-exact same-width overwrite of the stat
+  in the copy; editing a stat the item doesn't carry is a clean no-op.
 
 ---
 

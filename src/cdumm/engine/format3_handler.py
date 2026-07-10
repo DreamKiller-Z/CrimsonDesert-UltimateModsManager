@@ -735,12 +735,23 @@ def _classify_clone(
         pf = str(p.get("field", "")) if isinstance(p, dict) else ""
         if not pf:
             return "clone_record patch is missing a 'field'"
+        # gear_stat[...] on iteminfo is a byte-exact same-width i64 stat
+        # overwrite located structurally in the record's opaque tail ,
+        # allowed the same as a gear_stat SET on an existing item. Editing
+        # a stat the clone doesn't carry is a clean no-op at apply time.
+        if pf.startswith("gear_stat[") and table_name == "iteminfo":
+            if _gear_stats_available():
+                continue
+            return (
+                f"clone patch field {pf!r} targets a gear stat, but "
+                f"gear-stat editing isn't available in this build"
+            )
         resolved = _resolve_schema_field_name(pf, field_specs)
         if resolved is None:
             return (
                 f"clone patch field {pf!r} isn't a plain schema field; "
-                f"clone patches currently support verified scalar fields "
-                f"only"
+                f"clone patches support verified scalar fields and "
+                f"gear_stat[...] on iteminfo"
             )
         if vf is not None and resolved not in vf:
             return (
@@ -1572,6 +1583,60 @@ def _raw_entries(table_name: str, body: bytes, header: bytes
     return out
 
 
+def _gear_stats_available() -> bool:
+    """Whether the gear-stat editing module is present in this build. It
+    ships with the gear-stats feature; guarding on it keeps clone's
+    gear_stat support from breaking builds where that feature isn't
+    merged yet (so this file stays independent of it)."""
+    try:
+        import cdumm.engine.gear_stats  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _apply_gear_patches_to_new_record(
+    table_name: str, new_body: bytes, new_header: bytes,
+    new_offset: int, gear_patches: list[dict],
+) -> bytes | None:
+    """Apply ``gear_stat[...]`` patches to the freshly-cloned record (the
+    last record, at ``new_offset``).
+
+    Each patch is a byte-exact **same-width** i64 overwrite located
+    structurally in the record's opaque equipment tail — the same
+    mechanism as a gear_stat SET on an existing item, verified byte-exact
+    on the live iteminfo table. A stat the clone doesn't carry is a clean
+    no-op. Returns the new body, or ``None`` if an edit somehow changed
+    the record length (a same-width overwrite never should)."""
+    try:
+        from cdumm.engine import gear_stats as _gs
+    except Exception:
+        # gear-stat editing not in this build -> leave the clone as-is
+        # (validate already gates gear_stat patches on availability).
+        return bytes(new_body)
+    all_recs = _raw_entries(table_name, new_body, new_header)
+    if not all_recs:
+        return None
+    whitelist = _gs.build_stat_whitelist(list(all_recs.values()))
+    rec = bytes(new_body)[new_offset:]   # the appended clone
+    located = _gs.locate_gear_stats(rec, whitelist)
+    edited = rec
+    for p in gear_patches:
+        idx = _gs.resolve_gear_stat_index(str(p["field"]), located)
+        if idx is None:
+            continue   # clone doesn't carry this stat -> clean no-op
+        try:
+            nv = int(p["new"])
+        except (TypeError, ValueError):
+            continue
+        edited = _gs.apply_stat_edit(
+            edited, located[idx].value_offset, nv)
+        located = _gs.locate_gear_stats(edited, whitelist)
+    if len(edited) != len(rec):
+        return None   # same-width overwrite must not change length
+    return bytes(new_body)[:new_offset] + edited
+
+
 def apply_clone_to_pabgb_bytes(
     table_name: str,
     body: bytes,
@@ -1666,21 +1731,36 @@ def apply_clone_to_pabgb_bytes(
         + struct.pack("<I", new_offset)
     )
 
-    # Apply patches to the fresh record via the trusted set writer.
-    patches = clone.get("patches") or []
+    # Apply patches to the fresh record. Scalar fields go through the
+    # trusted set writer; gear_stat[...] fields are byte-exact same-width
+    # i64 overwrites located structurally in the record's opaque tail
+    # (only the freshly-appended clone is touched — it's the last record).
+    patches = [p for p in (clone.get("patches") or [])
+               if isinstance(p, dict) and "field" in p and "new" in p]
     try:
         entry_name = name_bytes.decode("utf-8")
     except UnicodeDecodeError:
         entry_name = ""
-    patch_intents = [
-        Format3Intent(entry=entry_name, key=new_key,
-                      field=str(p["field"]), op="set", new=p["new"])
-        for p in patches
-        if isinstance(p, dict) and "field" in p and "new" in p
-    ]
-    if patch_intents:
+    scalar_patches = [
+        p for p in patches
+        if not str(p["field"]).startswith("gear_stat[")]
+    gear_patches = [
+        p for p in patches
+        if str(p["field"]).startswith("gear_stat[")]
+    if scalar_patches:
+        patch_intents = [
+            Format3Intent(entry=entry_name, key=new_key,
+                          field=str(p["field"]), op="set", new=p["new"])
+            for p in scalar_patches
+        ]
         new_body = apply_intents_to_pabgb_bytes(
             tn, new_body, new_header, patch_intents)
+    if gear_patches:
+        edited = _apply_gear_patches_to_new_record(
+            tn, new_body, new_header, new_offset, gear_patches)
+        if edited is None:
+            return None
+        new_body = edited
 
     # ── Self-check: corruption-proof gate ──────────────────────────
     # 1. Append-only: original body prefix untouched.

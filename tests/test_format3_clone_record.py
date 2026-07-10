@@ -243,6 +243,31 @@ def test_validate_clone_no_schema_skipped():
     assert "needs a decoded schema" in v.skipped[0][1]
 
 
+def test_validate_clone_gear_stat_patch_on_iteminfo():
+    # gear_stat[...] on iteminfo is a byte-exact structural stat overwrite,
+    # so clone patches may target it (real: clone a weapon, buff its damage)
+    # — but only when the gear-stat feature is present in the build.
+    from cdumm.engine.format3_handler import _gear_stats_available
+    i = _parse_intents_block([{
+        "op": "clone_record", "source_key": 1000080, "new_key": 1000090,
+        "patches": [{"field": "gear_stat[1000000]", "new": 500}]}])[0]
+    v = validate_intents("iteminfo.pabgb", [i])
+    if _gear_stats_available():
+        assert i in v.supported, v.skipped
+    else:
+        assert not v.supported
+        assert "gear-stat editing isn't available" in v.skipped[0][1]
+
+
+def test_validate_clone_rejects_gear_stat_on_non_iteminfo(monkeypatch):
+    _inject(monkeypatch, verified_fields=frozenset({"_foo", "_bar"}))
+    i = _parse_intents_block([{
+        "op": "clone_record", "source_key": 100, "new_key": 500,
+        "patches": [{"field": "gear_stat[5]", "new": 1}]}])[0]
+    v = validate_intents("synthtest.pabgb", [i])
+    assert not v.supported   # gear_stat is only allowed on iteminfo
+
+
 # ── Apply-pipeline wiring ───────────────────────────────────────────
 
 
