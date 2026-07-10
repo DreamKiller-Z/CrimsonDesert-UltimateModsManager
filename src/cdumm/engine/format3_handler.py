@@ -54,7 +54,12 @@ from cdumm.engine.field_schema import (
     load_field_schema,
     locate_field,
 )
-from cdumm.semantic.parser import get_schema, has_schema, parse_pabgh_index
+from cdumm.semantic.parser import (
+    get_schema,
+    has_schema,
+    parse_pabgh_index,
+    parse_records,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +144,7 @@ class Format3Intent:
     new: Any
     old: str | None = None
     match: dict | None = None
+    clone: dict | None = None
 
 
 @dataclass
@@ -178,6 +184,52 @@ class Format3Validation:
 # ── Parsing ─────────────────────────────────────────────────────────
 
 
+def _parse_clone_intent(raw: dict, i: int, label: str) -> Format3Intent:
+    """Parse a ``clone_record`` intent.
+
+    Shape: ``{"op":"clone_record","source_key":N,"new_key":M,
+    "new_name":"...","patches":[{"field":..,"new":..}, ...]}``. Copies the
+    record at ``source_key`` to a brand-new record keyed ``new_key`` (with
+    an optional new name), then applies ``patches`` (field sets) to the
+    copy. Raises ValueError with a located message on malformed input.
+    """
+    src = raw.get("source_key")
+    new_key = raw.get("new_key")
+    for name, val in (("source_key", src), ("new_key", new_key)):
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise ValueError(
+                f"{label} intent #{i} clone_record needs an integer "
+                f"'{name}' (a record id); got {val!r}"
+            )
+    new_name = raw.get("new_name")
+    if new_name is not None and not isinstance(new_name, str):
+        raise ValueError(
+            f"{label} intent #{i} clone_record 'new_name' must be a string"
+        )
+    raw_patches = raw.get("patches", [])
+    if not isinstance(raw_patches, list):
+        raise ValueError(
+            f"{label} intent #{i} clone_record 'patches' must be a list"
+        )
+    patches: list[dict] = []
+    for j, p in enumerate(raw_patches):
+        if not isinstance(p, dict) or "field" not in p or "new" not in p:
+            raise ValueError(
+                f"{label} intent #{i} clone_record patch #{j} must be an "
+                f"object with 'field' and 'new'"
+            )
+        patches.append({"field": str(p["field"]), "new": p["new"]})
+    clone: dict = {
+        "source_key": src, "new_key": new_key, "patches": patches,
+    }
+    if new_name is not None:
+        clone["new_name"] = new_name
+    return Format3Intent(
+        entry="", key=0, field="", op="clone_record",
+        new=None, old=None, match=None, clone=clone,
+    )
+
+
 def _parse_intents_block(
     raw_intents, label: str = "intents",
 ) -> list[Format3Intent]:
@@ -199,6 +251,12 @@ def _parse_intents_block(
             raise ValueError(
                 f"{label} intent #{i} is not a JSON object"
             )
+        # clone_record is a record-creation op with its own shape
+        # (source_key / new_key / new_name / patches) and doesn't use the
+        # entry/field/new triple, so parse it here and move on.
+        if raw.get("op") == "clone_record":
+            intents.append(_parse_clone_intent(raw, i, label))
+            continue
         # The newer skill .field.json variant drops 'op' since 'set'
         # is implicit. We default to 'set' when absent. GitHub #66.
         # GitHub #125 AgentRatchet: DMM v3.1 mods (e.g. Refinement Cost
@@ -582,6 +640,53 @@ def _classify_match_selector(
     return None
 
 
+def _classify_clone(
+    intent: Format3Intent, schema, field_specs: dict,
+    fs_entries: dict, table_name: str
+) -> str | None:
+    """Validate a ``clone_record`` intent. Returns None when supported,
+    else a skip reason.
+
+    A clone is supported when source_key/new_key are integers and every
+    patch targets a plain schema field that is writable (reachable by the
+    set writer) and verified. Collision of ``new_key`` and existence of
+    ``source_key`` can only be known against the real table bytes, so
+    those are enforced at apply time (the clone writer refuses + logs);
+    here we validate structure and the patch fields.
+    """
+    clone = intent.clone or {}
+    src = clone.get("source_key")
+    new_key = clone.get("new_key")
+    if isinstance(src, bool) or not isinstance(src, int):
+        return "clone_record needs an integer source_key"
+    if isinstance(new_key, bool) or not isinstance(new_key, int):
+        return "clone_record needs an integer new_key"
+    vf = getattr(schema, "verified_fields", None)
+    for p in clone.get("patches") or []:
+        pf = str(p.get("field", "")) if isinstance(p, dict) else ""
+        if not pf:
+            return "clone_record patch is missing a 'field'"
+        resolved = _resolve_schema_field_name(pf, field_specs)
+        if resolved is None:
+            return (
+                f"clone patch field {pf!r} isn't a plain schema field; "
+                f"clone patches currently support verified scalar fields "
+                f"only"
+            )
+        if vf is not None and resolved not in vf:
+            return (
+                f"clone patch field {pf!r} is not a verified field of "
+                f"this table; patching it is unsafe"
+            )
+        temp = Format3Intent(entry="", key=new_key, field=pf,
+                             op="set", new=p.get("new"))
+        reason = _classify_intent(
+            temp, schema, field_specs, fs_entries, table_name)
+        if reason is not None:
+            return f"clone patch field {pf!r}: {reason}"
+    return None
+
+
 def validate_intents(
     target: str, intents: list[Format3Intent]
 ) -> Format3Validation:
@@ -615,6 +720,11 @@ def validate_intents(
                 result.skipped.append((
                     mi,
                     f"match selector needs a decoded schema for table "
+                    f"'{table_name}', which CDUMM doesn't have yet"))
+            elif mi.clone is not None or mi.op == "clone_record":
+                result.skipped.append((
+                    mi,
+                    f"clone_record needs a decoded schema for table "
                     f"'{table_name}', which CDUMM doesn't have yet"))
             else:
                 kept.append(mi)
@@ -665,6 +775,17 @@ def validate_intents(
     fs_entries = load_field_schema(table_name)
 
     for intent in intents:
+        # clone_record is a record-creation op with its own validator; it
+        # must be routed before the set-oriented op partition (which would
+        # otherwise reject it as an unknown op).
+        if intent.op == "clone_record" or intent.clone is not None:
+            reason = _classify_clone(
+                intent, schema, field_specs, fs_entries, table_name)
+            if reason is None:
+                result.supported.append(intent)
+            else:
+                result.skipped.append((intent, reason))
+            continue
         # Unsupported op is checked first; the schema/field walker
         # below assumes op == 'set' and would silently do a set-style
         # write for e.g. op='append' otherwise.
@@ -1269,6 +1390,179 @@ def _pack_value(value, spec) -> bytes | None:
         # Out-of-range, wrong type, etc. Caller's job to refuse
         # rather than corrupting bytes.
         return None
+
+
+def _raw_entries(table_name: str, body: bytes, header: bytes
+                 ) -> dict[int, bytes]:
+    """``{record_key: raw entry bytes}`` using the sorted PABGH offsets.
+
+    A small local copy of the record-slicing logic so the clone writer
+    stays self-contained (doesn't depend on a parser helper that isn't
+    present on every branch).
+    """
+    _ks, offsets = parse_pabgh_index(header, table_name)
+    if not offsets:
+        return {}
+    ordered = sorted(offsets.items(), key=lambda kv: kv[1])
+    out: dict[int, bytes] = {}
+    for i, (k, off) in enumerate(ordered):
+        end = ordered[i + 1][1] if i + 1 < len(ordered) else len(body)
+        if off < len(body):
+            out[k] = bytes(body)[off:end]
+    return out
+
+
+def apply_clone_to_pabgb_bytes(
+    table_name: str,
+    body: bytes,
+    header: bytes,
+    clone: dict,
+) -> tuple[bytes, bytes] | None:
+    """Clone one record to a new key + name and apply field patches.
+
+    Community-standard ``clone_record``: deep-copy the source record's raw
+    bytes, give the copy ``new_key`` (rewriting the entry-header id and the
+    ``.pabgh`` index key) and an optional ``new_name``, append it to the
+    end of the table, then apply ``patches`` (a list of ``{field, new}``
+    sets) to the copy.
+
+    Returns ``(new_body, new_header)`` or ``None`` when the clone can't be
+    done safely. Corruption is impossible by construction + a mandatory
+    parse-back self-check:
+
+      * append-only — every existing record's bytes and ``.pabgh`` offset
+        are preserved untouched (verified: ``new_body`` starts with ``body``
+        and the rebuilt index equals the old one plus the new entry);
+      * the rebuilt table is re-decoded and the new record verified to be a
+        faithful copy of the source (equal on every non-patched field).
+
+    Any failure — bad key, key collision, unhandled ``.pabgh`` width, a
+    self-check miss — returns ``None`` so the caller emits no change.
+    """
+    tn = _table_name_from_target(table_name)
+    schema = get_schema(tn)
+    if schema is None:
+        return None
+
+    source_key = clone.get("source_key")
+    new_key = clone.get("new_key")
+    if isinstance(source_key, bool) or not isinstance(source_key, int):
+        return None
+    if isinstance(new_key, bool) or not isinstance(new_key, int):
+        return None
+
+    key_size, offsets = parse_pabgh_index(header, tn)
+    if not offsets or key_size not in (2, 4):
+        return None
+    if source_key not in offsets:
+        return None
+    if new_key in offsets:
+        return None  # collision — refuse rather than overwrite
+    if new_key < 0 or new_key >= (1 << (key_size * 8)):
+        return None  # doesn't fit the index key width
+
+    count = len(offsets)
+    count_size = len(header) - count * (key_size + 4)
+    if count_size not in (2, 4):
+        return None  # .pabgh isn't the plain [count][key,offset]* shape
+
+    src = _raw_entries(tn, body, header).get(source_key)
+    if not src:
+        return None
+
+    # Entry layout: [entry_id(eid_size)][name_len u32][name][0x00][payload]
+    eid_size = 2 if key_size == 2 else 4
+    if len(src) < eid_size + 4:
+        return None
+    name_len = struct.unpack_from("<I", src, eid_size)[0]
+    name_start = eid_size + 4
+    name_end = name_start + name_len
+    if name_end >= len(src) or src[name_end] != 0:
+        return None  # malformed / no null terminator where expected
+    payload = src[name_end + 1:]
+
+    new_name = clone.get("new_name")
+    if new_name is None:
+        name_bytes = src[name_start:name_end]
+    elif isinstance(new_name, str):
+        name_bytes = new_name.encode("utf-8")
+    else:
+        return None
+
+    new_entry = (
+        new_key.to_bytes(eid_size, "little")
+        + struct.pack("<I", len(name_bytes))
+        + name_bytes + b"\x00" + payload
+    )
+    new_offset = len(body)
+    new_body = bytes(body) + new_entry
+
+    # Append (new_key, new_offset) to the index; existing bytes preserved.
+    count_fmt = "<I" if count_size == 4 else "<H"
+    new_header = (
+        struct.pack(count_fmt, count + 1)
+        + bytes(header)[count_size:]
+        + new_key.to_bytes(key_size, "little")
+        + struct.pack("<I", new_offset)
+    )
+
+    # Apply patches to the fresh record via the trusted set writer.
+    patches = clone.get("patches") or []
+    try:
+        entry_name = name_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        entry_name = ""
+    patch_intents = [
+        Format3Intent(entry=entry_name, key=new_key,
+                      field=str(p["field"]), op="set", new=p["new"])
+        for p in patches
+        if isinstance(p, dict) and "field" in p and "new" in p
+    ]
+    if patch_intents:
+        new_body = apply_intents_to_pabgb_bytes(
+            tn, new_body, new_header, patch_intents)
+
+    # ── Self-check: corruption-proof gate ──────────────────────────
+    # 1. Append-only: original body prefix untouched.
+    if new_body[:len(body)] != body:
+        return None
+    # 2. Index integrity: rebuilt index == old index + the new entry.
+    ks2, offs2 = parse_pabgh_index(new_header, tn)
+    if ks2 != key_size:
+        return None
+    expected = dict(offsets)
+    expected[new_key] = new_offset
+    if offs2 != expected:
+        return None
+    # 3. Faithful copy: decode both and compare the new record to the
+    #    source on every non-metadata, non-patched field.
+    field_specs = {f.name: f for f in schema.fields}
+    patched_names = set()
+    for p in patches:
+        if isinstance(p, dict) and "field" in p:
+            r = _resolve_schema_field_name(str(p["field"]), field_specs)
+            if r:
+                patched_names.add(r)
+    old_records = parse_records(tn, body, header)
+    new_records = parse_records(tn, new_body, new_header)
+    if new_key not in new_records or source_key not in old_records:
+        return None
+    src_rec = old_records[source_key]
+    new_rec = new_records[new_key]
+    _meta = {"_key", "_entry_id", "_name"}
+    for fname, val in src_rec.items():
+        if fname in _meta or fname in patched_names:
+            continue
+        if new_rec.get(fname) != val:
+            return None
+    # 4. Every original record still decodes byte-identically.
+    old_raw = _raw_entries(tn, body, header)
+    new_raw = _raw_entries(tn, new_body, new_header)
+    for k, rb in old_raw.items():
+        if new_raw.get(k) != rb:
+            return None
+
+    return new_body, new_header
 
 
 def apply_intents_to_pabgb_bytes(
