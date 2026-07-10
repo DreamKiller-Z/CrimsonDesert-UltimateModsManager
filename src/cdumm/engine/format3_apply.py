@@ -46,6 +46,8 @@ from cdumm.engine.field_schema import (
 )
 from cdumm.engine.format3_handler import (
     Format3Intent,
+    _snake_to_camel,
+    _table_name_from_target,
     parse_format3_mod,
     parse_format3_mod_targets,
     validate_intents,
@@ -55,6 +57,7 @@ from cdumm.semantic.parser import (
     has_schema,
     identify_table_from_path,
     parse_pabgh_index,
+    parse_records,
 )
 
 logger = logging.getLogger(__name__)
@@ -65,6 +68,132 @@ VanillaExtractor = Callable[[str], "tuple[bytes, bytes] | None"]
 bytes for the vanilla version of that file, or None if the file
 can't be extracted. apply_engine wires this to its existing
 ``_get_vanilla_entry_content`` + ``_extract_sibling_entry`` helpers."""
+
+
+# ── 'match' selector expansion ───────────────────────────────────────
+#
+# A Format 3 intent may carry a ``match`` selector instead of a single
+# ``entry``/``key``: ``{"match": {field: value, ...}, "field": F,
+# "new": N}`` targets *every* record whose fields all equal the given
+# values (AND across conditions). We resolve that here, at apply time,
+# once the table's vanilla bytes are in hand: decode the table with the
+# same ``parse_records`` the diff/apply pipeline already uses, find the
+# matching record keys, and emit one ordinary per-record ``set`` intent
+# for each. Those flow through the existing, already-trusted writer path
+# (and its verified-field write gate) — so ``match`` adds no new
+# byte-writing code and cannot introduce a new corruption path. Matching
+# is gated in ``validate_intents`` to verified (or metadata) fields, so
+# we only ever compare against trustworthy decoded values.
+
+
+def _lookup_record_field(rec: dict, field: str):
+    """Return ``rec``'s value for ``field``, trying the same four name
+    shapes the writer uses (exact / +underscore / snake→camel /
+    snake→camel +underscore). Returns ``None`` if no shape is present."""
+    if field in rec:
+        return rec[field]
+    cand = [field, f"_{field}"]
+    if "_" in field:
+        camel = _snake_to_camel(field)
+        if camel != field:
+            cand += [camel, f"_{camel}"]
+    for n in cand:
+        if n in rec:
+            return rec[n]
+    return None
+
+
+def _match_value_equals(got, want) -> bool:
+    """Type-tolerant equality between a decoded record value ``got`` and
+    a mod-authored JSON value ``want`` (e.g. JSON ``5`` vs decoded int,
+    or JSON ``"5"`` vs decoded ``5``)."""
+    if got is None:
+        return False
+    if got == want:
+        return True
+    # numeric tolerance (int vs float), excluding bool surprises.
+    if (isinstance(got, (int, float)) and not isinstance(got, bool)
+            and isinstance(want, (int, float)) and not isinstance(want, bool)):
+        try:
+            return float(got) == float(want)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    # string-form tolerance ("5" == 5).
+    if isinstance(want, str) and not isinstance(got, str):
+        return str(got) == want
+    return False
+
+
+def _match_record_keys(records: dict, match: dict) -> list:
+    """Keys of every record in ``records`` whose fields all satisfy the
+    ``match`` conditions (AND). Preserves ``records`` iteration order."""
+    out = []
+    for key, rec in records.items():
+        if all(
+            _match_value_equals(
+                rec.get(mf) if mf in ("_name", "_key", "_entry_id")
+                else _lookup_record_field(rec, mf),
+                mv,
+            )
+            for mf, mv in match.items()
+        ):
+            out.append(key)
+    return out
+
+
+def _expand_match_intents(
+    target: str,
+    vanilla_body: bytes,
+    vanilla_header: bytes,
+    intents: list[Format3Intent],
+) -> list[Format3Intent]:
+    """Replace each ``match`` intent in ``intents`` with concrete
+    per-record ``set`` intents; pass non-match intents through unchanged.
+
+    Decodes the target table once via ``parse_records`` and, for each
+    ``match`` intent, emits one ``Format3Intent`` per matched record
+    carrying that record's real ``_name``/``_key`` so the existing writer
+    resolves it exactly like a hand-authored single-record intent.
+    """
+    # ``getattr`` guard: some intent stand-ins (and any future
+    # lightweight intent type) may not carry a ``match`` attribute at
+    # all — those are, by definition, not match selectors.
+    if not any(getattr(i, "match", None) is not None for i in intents):
+        return list(intents)
+
+    table_name = _table_name_from_target(target)
+    try:
+        records = parse_records(table_name, vanilla_body, vanilla_header)
+    except Exception:  # noqa: BLE001 - decode must never break apply
+        logger.warning(
+            "Format 3 match: could not decode %s to resolve a match "
+            "selector; those intents produce 0 changes.", target,
+            exc_info=True)
+        records = {}
+
+    out: list[Format3Intent] = []
+    for intent in intents:
+        match = getattr(intent, "match", None)
+        if match is None:
+            out.append(intent)
+            continue
+        matched = _match_record_keys(records, match) if records else []
+        for key in matched:
+            rec = records[key]
+            out.append(Format3Intent(
+                entry=str(rec.get("_name", "")),
+                key=int(rec.get("_key", key)),
+                field=intent.field,
+                op="set",
+                new=intent.new,
+                old=getattr(intent, "old", None),
+                match=None,
+            ))
+        logger.info(
+            "Format 3 match on %s (%s == …) expanded to %d record(s) "
+            "for field %r.", target, ",".join(match), len(matched),
+            intent.field)
+    return out
 
 
 def expand_format3_into_aggregated(
@@ -213,14 +342,33 @@ def expand_format3_into_aggregated(
                     continue
                 vanilla_body, vanilla_header = vanilla
 
+                # Expand any 'match' selector intents into concrete
+                # per-record 'set' intents now that the table bytes are
+                # available to decode. Non-match intents pass through
+                # untouched, so this is a no-op for the common case.
+                supported = _expand_match_intents(
+                    target, vanilla_body, vanilla_header,
+                    validation.supported)
+                if not supported:
+                    # Every intent was a match selector that resolved to
+                    # zero records (or the table wouldn't decode). Nothing
+                    # to write, but not an error , report like other
+                    # zero-change cases.
+                    n_mods_skipped += 1
+                    logger.debug(
+                        "Format 3 mod '%s' (id=%d): match selector(s) for "
+                        "%s matched 0 records; 0 byte changes.",
+                        mod_name, mod_id, target)
+                    continue
+
                 # Whole-table writer targets: defer dispatch to the
                 # post-loop phase so all mods' intents land in a single
                 # parse+serialize.
                 if target in _WHOLE_TABLE_TARGETS:
                     whole_table_intents.setdefault(target, []).extend(
-                        validation.supported)
+                        supported)
                     whole_table_intent_mods.setdefault(target, []).extend(
-                        [mod_name] * len(validation.supported))
+                        [mod_name] * len(supported))
                     whole_table_mod_names.setdefault(target, []).append(mod_name)
                     whole_table_mod_ids.setdefault(target, []).append(mod_id)
                     n_mods_changed += 1  # provisional; recounted below if no bytes
@@ -235,13 +383,13 @@ def expand_format3_into_aggregated(
                         "Format 3 batched %d supported intent(s) from mod "
                         "'%s' (id=%d) into whole-table writer queue for %s "
                         "(queue depth now %d)",
-                        len(validation.supported), mod_name, mod_id,
+                        len(supported), mod_name, mod_id,
                         target, len(whole_table_intents[target]))
                     continue
 
                 # Convert each supported intent into a v2-style change dict
                 changes = _intents_to_v2_changes(
-                    target, vanilla_body, vanilla_header, validation.supported)
+                    target, vanilla_body, vanilla_header, supported)
                 if not changes:
                     n_mods_skipped += 1
                     # Don't pollute aggregated with empty lists.
@@ -249,7 +397,7 @@ def expand_format3_into_aggregated(
                         "Format 3 mod '%s' (id=%d): all %d supported intents "
                         "resolved to zero changes (probably TID-not-found "
                         "or value out of range).",
-                        mod_name, mod_id, len(validation.supported))
+                        mod_name, mod_id, len(supported))
                     if warnings_out is not None:
                         warnings_out.append(
                             f"Format 3 mod '{mod_name}' produced 0 byte "

@@ -123,6 +123,14 @@ class Format3Intent:
     for ``old`` bytes and replaces them with ``new``. For regular
     primitive / list intents ``old`` stays None and ``new`` is the
     typed value to set.
+
+    ``match`` is an optional selector: when set to a ``{field: value}``
+    mapping, the intent targets *every* record in the table whose
+    fields all equal the given values (AND across conditions) instead
+    of a single ``entry``/``key``. The apply path decodes the table and
+    expands one such intent into N concrete per-record ``set`` intents
+    before writing, so no new byte-writing path is introduced. When
+    ``match`` is set, ``entry`` is empty and ``key`` is 0 (both unused).
     """
     entry: str
     key: int
@@ -130,6 +138,7 @@ class Format3Intent:
     op: str
     new: Any
     old: str | None = None
+    match: dict | None = None
 
 
 @dataclass
@@ -201,7 +210,24 @@ def _parse_intents_block(
         # mod author may not have populated. Accept missing key when an
         # entry name is present, default it to 0 (apply path looks up by
         # entry name and only falls back to key if the name miss).
-        for required in ("entry", "field"):
+        # A ``match`` selector replaces the single-record ``entry``/``key``
+        # locator: it targets every record whose fields all equal the
+        # given values (AND). When present, ``entry`` is not required ,
+        # the apply path resolves records by decoding the table. ``field``
+        # and ``new`` are always required.
+        raw_match = raw.get("match")
+        if raw_match is not None and (
+            not isinstance(raw_match, dict) or not raw_match
+        ):
+            raise ValueError(
+                f"{label} intent #{i} has an invalid 'match' selector; "
+                f"'match' must be a non-empty object of field:value "
+                f"conditions"
+            )
+        required_keys = (
+            ("field",) if raw_match is not None else ("entry", "field")
+        )
+        for required in required_keys:
             if required not in raw:
                 raise ValueError(
                     f"{label} intent #{i} is missing required key "
@@ -245,12 +271,13 @@ def _parse_intents_block(
         # one unsupported intent shows up in the per-mod skipped summary
         # instead of taking the whole import down.
         intents.append(Format3Intent(
-            entry=str(raw["entry"]),
+            entry=str(raw.get("entry", "")),
             key=raw_key,
             field=str(raw["field"]),
             op=str(raw.get("op", "set")),
             new=raw["new"],
             old=raw_old,
+            match=raw_match,
         ))
     return intents
 
@@ -501,6 +528,60 @@ def _partition_unsupported_op(
     )
 
 
+def _resolve_schema_field_name(
+    name: str, field_specs: dict
+) -> str | None:
+    """Resolve a mod-authored field name to its canonical schema field
+    name, trying the same four shapes the writer uses (exact /
+    +underscore / snake→camel / snake→camel +underscore). Returns None
+    if no shape is present in ``field_specs``."""
+    cand = [name, f"_{name}"]
+    if "_" in name:
+        camel = _snake_to_camel(name)
+        if camel != name:
+            cand += [camel, f"_{camel}"]
+    for n in cand:
+        if n in field_specs:
+            return n
+    return None
+
+
+# Metadata keys ``parse_records`` always attaches, decoded from the
+# entry header (not the payload) so they're trustworthy to match on
+# regardless of a table's ``verified_fields`` coverage.
+_MATCH_META_FIELDS = frozenset({"_name", "_key", "_entry_id"})
+
+
+def _classify_match_selector(
+    intent: Format3Intent, schema, field_specs: dict
+) -> str | None:
+    """Validate a ``match`` intent's selector fields. Returns None when
+    every match-field is safe to compare against — a hand-verified field
+    (present in the table's ``verified_fields``) or the always-safe
+    ``_name``/``_key``/``_entry_id`` metadata — otherwise a skip reason.
+
+    Matching on an unverified field would compare against a garbage
+    decode (its byte offset is unproven), so we refuse it, mirroring the
+    write-time gate in ``format3_apply._resolve_write_pos``.
+    """
+    match = intent.match or {}
+    vf = getattr(schema, "verified_fields", None)
+    for mf in match:
+        if mf in _MATCH_META_FIELDS:
+            continue
+        resolved = _resolve_schema_field_name(mf, field_specs)
+        if resolved is None:
+            return (
+                f"match field {mf!r} is not a known field of this table"
+            )
+        if vf is not None and resolved not in vf:
+            return (
+                f"match field {mf!r} is not a verified field of this "
+                f"table; matching on an unverified field is unsafe"
+            )
+    return None
+
+
 def validate_intents(
     target: str, intents: list[Format3Intent]
 ) -> Format3Validation:
@@ -523,6 +604,22 @@ def validate_intents(
         #      ``old`` inside the entry's payload bounds. Used by
         #      _buff_data_raw style intents on skill.pabgb where the
         #      mod author ships the full vanilla + modded bytes.
+        #
+        # A ``match`` selector needs a decoded PABGB schema (parse_records)
+        # to resolve which records it applies to; a table with no schema
+        # can't support it. Skip those here with a precise reason so they
+        # never slip through to the writer unexpanded.
+        kept: list[Format3Intent] = []
+        for mi in intents:
+            if mi.match is not None:
+                result.skipped.append((
+                    mi,
+                    f"match selector needs a decoded schema for table "
+                    f"'{table_name}', which CDUMM doesn't have yet"))
+            else:
+                kept.append(mi)
+        intents = kept
+
         fs_entries = load_field_schema(table_name)
 
         def _routable(i: Format3Intent) -> bool:
@@ -577,6 +674,11 @@ def validate_intents(
             continue
         reason = _classify_intent(
             intent, schema, field_specs, fs_entries, table_name)
+        # A match selector additionally requires every match-field to be
+        # safe to compare against (verified or metadata). The target
+        # field itself was already vetted by _classify_intent above.
+        if reason is None and intent.match is not None:
+            reason = _classify_match_selector(intent, schema, field_specs)
         if reason is None:
             result.supported.append(intent)
         else:
