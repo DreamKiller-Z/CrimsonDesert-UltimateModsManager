@@ -157,6 +157,41 @@ dispatch signature, capture, verify). But it is the only path that is
 **authoritative and survives patches**, and the metadata being unencrypted
 means the packer is not a blocker.
 
+**Path C′ — the unstripped macOS binary (newly found, likely the easiest
+of all).** NattKh's `PABGB_DECODE_PROCESS.md` (in the **MPL-2.0** SAVE-EDITOR
+repo — the *method* is licensed and citable, even though his tool code is
+not) documents exactly how the field order was recovered, and the key
+ingredient is not the Windows exe at all:
+
+> "The Mac binary (`CrimsonDesert_Steam-*`) has unstripped symbols with
+> error strings in Korean: `<Class>의 _<field>를 읽어들이는데 실패했다`
+> (= 'Failed to read _<field> of <Class>'). These appear in the EXACT read
+> order."
+
+So on the **macOS** build, a per-class regex over the error strings yields
+the field names *in serialization order* — no disassembly, no live process,
+no packer. That is dramatically cheaper than Path C's ASI hook.
+
+Tested whether the same shortcut works on the **Windows** exe we already
+have (2026-07-11): the Korean error-string machinery is present (4362
+"read", 5309 "fail" strings) and 105/113 ItemInfo field names are present —
+but the names are **not** laid out in order (longest ordered, packed run =
+2 fields). They're pointer-referenced from descriptor structs, so on Windows
+you still need IDA on the reader functions. **The Mac binary is the
+artifact that makes this a regex instead of an RE project.**
+
+Concrete next step for this path: obtain the macOS build of Crimson Desert
+(same game, Steam macOS depot), scan its per-class Korean error strings for
+field order, feed the result through the §4a harness (it must reproduce all
+7 known tables), then batch-add the tables that verify. This is the single
+highest-leverage lead found so far.
+
+The same doc independently confirms details CDUMM already implements — the
+pabgh index format detection, and the "#1 gotcha" that hash-lookup fields
+read a u32 from file but store a u16 in memory (CDUMM's `pabgh_rewrite`
+already handles this). Good corroboration that our own RE is on the right
+track.
+
 **Path B — per-table hand-RE (works today, slow, linear).** The
 `wantedinfo` method: pick a table, find one field whose value is
 independently cross-checkable in-game, verify its offset, add it to
@@ -243,11 +278,16 @@ big win available, and the licence is clean (MIT, with attribution).
       + `tests/test_schema_verify.py`. Any order source now runs through
       `verify_order_source` before it is trusted. This was the answer to
       "who's to say the rest works."
-- [ ] **Path C is the recommended durable answer**, and it is de-risked:
-      the reflection metadata is unencrypted in the exe (§4). Scope the ASI
-      reader-order hook. Static replay of the old schema addresses is out
-      (they've drifted); the live hook observes ground-truth order and
-      survives patches.
+- [ ] **Path C′ (macOS binary) is now the recommended first attempt** — it
+      is a regex over unstripped Korean error strings, per NattKh's MPL-2.0
+      method doc, not a live hook or a disassembly. Get the macOS build,
+      extract per-class field order, run it through §4a. Far cheaper than
+      Path C if it pans out.
+- [ ] **Path C (ASI reader-order hook)** stays the durable, version-proof
+      fallback for whatever the Mac scan can't resolve. The reflection
+      metadata is unencrypted in the exe (§4); the live hook observes
+      ground-truth order and survives patches. (Static replay of the old
+      schema addresses is out — they've drifted.)
 - [ ] **Path A in parallel, as the cheap interim:** bump
       `CrimsonDesertModdingTools` issue #1 on the back of the
       community-mapping PR. If it gets licensed, its parsers go straight
