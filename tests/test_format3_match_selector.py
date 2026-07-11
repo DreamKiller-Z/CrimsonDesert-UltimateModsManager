@@ -331,3 +331,44 @@ def test_validate_match_skipped_on_no_schema_table():
     assert not v.supported
     assert v.skipped
     assert "needs a decoded schema" in v.skipped[0][1]
+
+
+# ── list / any-of match (GitHub #272, pinapana's Crazy ExtraSockets) ────
+# A list on the mod side means "any of" (SQL IN), so one intent can target
+# a whole family of records instead of one intent per value.
+
+def test_match_value_list_is_any_of():
+    assert _match_value_equals(5, [1, 5, 9]) is True
+    assert _match_value_equals(7, [1, 5, 9]) is False
+
+
+def test_match_value_list_keeps_numeric_and_string_tolerance():
+    assert _match_value_equals(5, ["5", 9]) is True
+    assert _match_value_equals(5.0, [1, 5]) is True
+
+
+def test_match_value_empty_list_matches_nothing():
+    assert _match_value_equals(5, []) is False
+
+
+def test_match_value_list_vs_list_field_stays_exact_equality():
+    # When the record's own value is a list, a list on the mod side must
+    # keep exact-equality semantics so a genuinely list-valued field can
+    # still be matched whole (and never becomes an accidental any-of).
+    assert _match_value_equals([1, 2], [1, 2]) is True
+    assert _match_value_equals([1, 2], [1, 2, 3]) is False
+    assert _match_value_equals([3], [1, 2, 3]) is False
+
+
+def test_match_record_keys_selects_every_record_in_the_list():
+    records = {
+        1: {"_name": "a", "_key": 1, "kind": 10},
+        2: {"_name": "b", "_key": 2, "kind": 20},
+        3: {"_name": "c", "_key": 3, "kind": 30},
+        4: {"_name": "d", "_key": 4, "kind": 20},
+    }
+    # any-of picks up both kind==20 records plus kind==10
+    got = _match_record_keys(records, {"kind": [10, 20]})
+    assert got == [1, 2, 4]
+    # a single scalar still behaves exactly as before
+    assert _match_record_keys(records, {"kind": 30}) == [3]

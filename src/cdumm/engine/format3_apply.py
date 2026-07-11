@@ -106,9 +106,22 @@ def _lookup_record_field(rec: dict, field: str):
 def _match_value_equals(got, want) -> bool:
     """Type-tolerant equality between a decoded record value ``got`` and
     a mod-authored JSON value ``want`` (e.g. JSON ``5`` vs decoded int,
-    or JSON ``"5"`` vs decoded ``5``)."""
+    or JSON ``"5"`` vs decoded ``5``).
+
+    A list/tuple on the mod side means **any-of** (SQL ``IN``): the record
+    matches when its value equals any one candidate. That lets a single
+    intent target a whole family of records — pinapana's Crazy ExtraSockets
+    (GitHub #272) selects 63 ``equip_type_info`` values in one intent
+    instead of 63 separate intents.
+
+    When the record's own value is *itself* a list, a list on the mod side
+    keeps exact-equality semantics instead, so a genuinely list-valued
+    field can still be matched whole and the two meanings never collide.
+    """
     if got is None:
         return False
+    if isinstance(want, (list, tuple)) and not isinstance(got, (list, tuple)):
+        return any(_match_value_equals(got, w) for w in want)
     if got == want:
         return True
     # numeric tolerance (int vs float), excluding bool surprises.
