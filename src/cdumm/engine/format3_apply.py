@@ -38,6 +38,10 @@ import struct
 from pathlib import Path
 from typing import Callable
 
+# The writer's field-name resolver, shared on purpose: a `match` key must
+# accept exactly the spellings a `field` key accepts, and copying the rule
+# would let the two drift apart silently.
+from cdumm.engine.iteminfo_writer import _resolve_field_name
 from cdumm.engine.field_schema import (
     DTYPE_TABLE,
     FieldSchemaEntry,
@@ -93,11 +97,27 @@ not confuse "the key isn't there" with "the key holds None"."""
 
 
 def _lookup_one(d: dict, name: str):
-    """One path segment: ``d``'s value for ``name``, trying the same four
-    name shapes the writer uses (exact / +underscore / snake→camel /
-    snake→camel +underscore). ``_MISSING`` if no shape is present."""
+    """One path segment: ``d``'s value for ``name``. ``_MISSING`` if the
+    segment isn't present under any accepted spelling.
+
+    A ``match`` key must accept exactly the spellings the ``field`` key
+    accepts, or a mod half-works: the same name resolves for the write but
+    not for the selector, so the intent applies to nothing and reports no
+    error. So this bridges *both* directions:
+
+      * snake_case mod name -> camelCase record field, and
+      * camelCase mod name -> snake_case record field,
+
+    the second by delegating to the writer's ``_resolve_field_name``. That
+    is deliberately the *same function* the writer uses rather than a copy,
+    so the two can't drift -- it also carries the separator-insensitive
+    fallback (``_equipAbleHash`` -> ``equipable_hash``, GitHub #191), which
+    only accepts an unambiguous single match and so never silently picks
+    the wrong field.
+    """
     if name in d:
         return d[name]
+    # snake_case mod name -> camelCase record field.
     cand = [f"_{name}"]
     if "_" in name:
         camel = _snake_to_camel(name)
@@ -106,6 +126,12 @@ def _lookup_one(d: dict, name: str):
     for n in cand:
         if n in d:
             return d[n]
+    # camelCase mod name -> snake_case record field. The writer's resolver
+    # only takes this branch for underscore-prefixed names, so normalise to
+    # that shape; a bare `equipTypeInfo` then resolves like `_equipTypeInfo`.
+    key = _resolve_field_name(f"_{name.lstrip('_')}", d)
+    if key is not None:
+        return d[key]
     return _MISSING
 
 

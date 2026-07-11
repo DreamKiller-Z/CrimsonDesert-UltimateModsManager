@@ -62,11 +62,44 @@ def test_negative_index_counts_from_the_end():
 
 
 def test_snake_case_segments_resolve_camel_case_record_fields():
-    """The writer's four name shapes apply per segment, exactly as they do
-    for flat fields: a snake_case mod field finds a camelCase record field.
-    (Not the reverse -- flat fields have never done that either.)"""
     rec = {"dropDefaultData": {"useSocket": 1}}
     assert _lookup_record_field(rec, "drop_default_data.use_socket") == 1
+
+
+def test_camel_case_segments_resolve_snake_case_record_fields():
+    """The other direction. A `match` key must accept every spelling a
+    `field` key accepts, or a mod half-works: the write resolves and the
+    selector doesn't, so the intent silently applies to nothing."""
+    assert _lookup_record_field(REC, "dropDefaultData.useSocket") == 1
+    assert _lookup_record_field(REC, "equipTypeInfo") == 4242
+
+
+def test_underscore_prefixed_camel_case_resolves():
+    """The schema/DMM dialect spelling."""
+    assert _lookup_record_field(REC, "_equipTypeInfo") == 4242
+    assert _lookup_record_field(REC, "_dropDefaultData._useSocket") == 1
+
+
+def test_separator_insensitive_fallback_still_applies():
+    """camelCase word boundaries don't always line up with the parser's
+    snake_case: `_equipAbleHash` must reach `equipable_hash` (GitHub #191).
+    Shared with the writer's resolver so the two can't drift."""
+    rec = {"equipable_hash": 77}
+    assert _lookup_record_field(rec, "_equipAbleHash") == 77
+
+
+def test_exact_camel_to_snake_wins_before_the_fuzzy_fallback():
+    """`_aB` maps deterministically to `a_b`; the separator-insensitive
+    fallback is only ever reached when that precise rule misses."""
+    assert _lookup_record_field({"a_b": 1, "ab": 2}, "_aB") == 1
+
+
+def test_ambiguous_normalised_match_is_refused():
+    """When the precise rule misses, the fuzzy fallback must refuse rather
+    than guess. `_equipAbleHash` -> `equip_able_hash` (absent), and the
+    normalised form `equipablehash` hits two keys -> no match."""
+    rec = {"equipable_hash": 1, "equipablehash": 2}
+    assert _lookup_record_field(rec, "_equipAbleHash") is None
 
 
 def test_underscore_prefixed_segments_resolve():
