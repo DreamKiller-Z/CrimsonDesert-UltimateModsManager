@@ -68,33 +68,83 @@ serialize.
 
 ## Stat IDs
 
-There are 15 distinct stat ids in vanilla 1.13. The game does not ship a
-stat-name table — the ids are an enum inside the executable — so most of
-them are listed here by id only. That is deliberate: an invented name is
-worse than a number.
+The names are **in the game**: `gamedata/statusinfo.pabgb` maps every stat
+id to its name. CDUMM reads it from your install (`load_stat_names()`), and
+ships a snapshot of the CD 1.13 table as a fallback
+(`cdumm.engine.stat_names.STAT_NAMES_CD113`, 75 entries). Prefer the live
+read — a hardcoded table goes stale the moment the game adds a stat.
 
-Three are **evidenced** by the game's own item names. Items called
-`Item_Stat_<Set>_<Thing>_LVn` carry a common baseline pair plus exactly
-one distinguishing stat, and the name says which:
+The 15 ids that vanilla 1.13 gear actually uses:
 
-| id | name | evidence |
+| id | name | notes |
 |---|---|---|
-| `1000007` | CriticalRate | `Item_Stat_AbyssGear_CriticalRate_LV1` |
-| `1000010` | AttackSpeedRate | `Item_Stat_AbyssGear_AttackSpeedRate_LV1` |
-| `1000011` | MoveSpeedRate | `Item_Stat_AbyssGear_MoveSpeedRate_LV1` |
+| `1000000` | Hp | |
+| `1000002` | DDD | damage dealt — on nearly every item |
+| `1000003` | DPV | defence — on nearly every item |
+| `1000005` | DDV | |
+| `1000007` | CriticalRate | |
+| `1000008` | AttackedDamageRate | |
+| `1000010` | AttackSpeedRate | |
+| `1000011` | MoveSpeedRate | |
+| `1000012` | ClimbSpeedRate | |
+| `1000017` | IceResistance | |
+| `1000026` | Stamina | |
+| `1000027` | Mp | |
+| `1000036` | Pressure | |
+| `1000037` | Stamina_UseResourceDecreaseRate | |
+| `1000043` | GuardPVRate | 92% of its carriers are shields |
 
-The two most common ids, `1000002` and `1000003`, appear on nearly every
-item (9189 and 9377 occurrences). They are almost certainly the primary
-offence/defence pair, but nothing in the shipped data *proves* which is
-which, so they are not named here.
+### ⚠️ The community mapping is wrong
 
-Other ids seen in vanilla: `1000000`, `1000005`, `1000008`, `1000012`,
-`1000017`, `1000026`, `1000027`, `1000036`, `1000037`, `1000043`.
+`buff_names_community.json` (NattKh/CrimsonDesertCommunityItemMapping) is
+widely used and is **incorrect on at least seven of these ids** — every
+entry in it is marked `verified: true`. If you build a mod against it you
+will boost a different stat than you intended.
+
+| id | game (`statusinfo`) | community says |
+|---|---|---|
+| `1000005` | DDV | ~~DPV Rate~~ |
+| `1000006` | CriticalDamage | ~~Critical Rate~~ |
+| `1000007` | **CriticalRate** | ~~Critical Damage~~ |
+| `1000008` | AttackedDamageRate | ~~Attack Damage Rate~~ |
+| `1000012` | ClimbSpeedRate | ~~Casting Speed Rate~~ |
+| `1000017` | IceResistance | ~~HP Regen~~ |
+| `1000026` | Stamina | ~~Air Attack Damage~~ |
+| `1000019` | EquipMainWeapon | ~~Guard PV Rate~~ (that's `1000043`) |
+
+`1000006` / `1000007` are straight **swapped**.
+
+Three independent checks say the game's table is the right one:
+
+1. **The raw bytes.** In `statusinfo.pabgb` the `u32` key sits physically
+   adjacent to the name string: `key=1000007 strlen=12 name=CriticalRate`.
+   No parser is involved, so a misaligned decode can't explain it.
+2. **The game names items after the stat they grant.**
+   `Item_Stat_AbyssGear_CriticalRate_LV1` carries stat `1000007`, and
+   `statusinfo` calls `1000007` CriticalRate. Same for AttackSpeedRate
+   (`1000010`) and MoveSpeedRate (`1000011`). Three agreements, zero
+   disagreements.
+3. **The community's ids aren't used by any gear.** They put "Guard PV
+   Rate" at `1000019` and "Critical Rate" at `1000006` — **zero** vanilla
+   gear items use either id. Meanwhile `1000043` (GuardPVRate, per the
+   game) is on 83 items, 76 of them shields. A mapping that names ids
+   nothing uses, and fails to name four ids that gear does use
+   (`1000027`, `1000036`, `1000037`, `1000043`), is a guess.
+
+Checks 2 and 3 run in CI (`tests/test_stat_names.py`).
+
+**One caveat, stated honestly.** What is proven is the id → *internal stat
+name* mapping. Whether BlackSpace's internal name faithfully describes the
+in-game *effect* is a separate question that files cannot answer — it is
+possible they named the enum `CriticalRate` while the effect is really crit
+damage, and that the community verified the effect empirically. Only in-game
+testing settles that. It does not change what you edit: the stat the game
+calls `CriticalRate` is `1000007`.
 
 Note that many named gear effects (`FireResistance`, `HpRegen`,
-`GuardPVRate`, …) carry **no** extra stat id at all — they act through
-`equip_buffs` / `item_effect_info` instead of the stat lists. Don't go
-looking for a stat id for those.
+`GuardPVRate` on the `Item_Stat_*` carriers, …) grant **no** stat id at all
+— they act through `equip_buffs` / `item_effect_info` instead of the stat
+lists. Don't go looking for a stat id for those.
 
 ## The gotcha that made this look "done" when it wasn't
 
