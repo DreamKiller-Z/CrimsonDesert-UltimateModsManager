@@ -165,30 +165,45 @@ time — and hand-RE'd layouts break on the next patch.
 
 ---
 
-## 4a. The prerequisite for ALL of them: a verification harness
+## 4a. The prerequisite for ALL of them: a verification harness — BUILT
 
 "Who's to say the rest works?" is the right question — and it is what sank
 naive trust in the community stat mapping (18 of 24 entries wrong, all
 flagged `verified`). The answer is not to trust any source, but to make
 every source **prove itself against ground truth we already hold.**
 
-CDUMM already has **13 tables with a verified, byte-exact file order**
-(§1). That is a free oracle. Any candidate order source — NattKh's parsers
-(Path A), a live ASI dump (Path C), or a hand-RE (Path B) — must, for each
-of those 13 tables:
+**Status: shipped** — `cdumm.engine.schema_verify`, tests in
+`tests/test_schema_verify.py`.
 
-1. reproduce the known `_ordered_fields` **exactly**, and
-2. round-trip the committed vanilla fixture **byte-for-byte**.
+CDUMM has **7 tables with a hand-verified `_ordered_fields`** (ItemInfo,
+VehicleInfo, FieldInfo, StageInfo, RegionInfo, CharacterInfo, WantedInfo).
+`verify_order_source(candidate)` takes a `{table: [field, ...]}` mapping —
+what Path A's parsers or a Path C dump would produce — and checks it two
+ways per table:
 
-A source that fails on any of the 13 is rejected outright. A source that
-passes all 13 has earned the benefit of the doubt on the other 82 — and
-even then each new table is gated to `verified_fields` (values
-cross-checked against real records) before its fields become writable.
+1. **Order identity** — the candidate's order must equal the verified
+   order exactly. This is the workhorse: it catches a scramble, a missing
+   or extra field, or a single misplaced field.
+2. **Fixture decode score** — where a committed fixture exists (ItemInfo,
+   via `vanilla113`), the candidate order is used to *walk the 6508 real
+   records*. This anchors our own ground truth to real bytes ("verified"
+   = "decodes real data", not "asserted") and flags gross corruption.
 
-This is cheap to build now (the 13 orders and their fixtures are in-repo),
-it is needed regardless of which path wins, and it is the concrete answer
-to the trust problem. **Build it first.** It converts "do we believe
-NattKh / our own dump?" into "it passed 13/13 or it didn't."
+The two are complementary and the tests prove it: ground truth passes 7/7;
+a scrambled order is rejected by **both** gates (identity mismatch **and**
+median fields decoded drops from 11 to 4); a single adjacent swap is caught
+by identity (its honest blind spot — same-width swaps upstream of the
+walker stall decode to the same byte count — is pinned as a test, so the
+division of labour is explicit).
+
+A source that fails either gate on any covered table is rejected. One that
+passes all it covers is `trustworthy` on those — and even then each new
+table stays gated to `verified_fields` before its fields become writable.
+
+> The decode score sharpens automatically as the walker reaches deeper.
+> On this branch it stalls at ~11 of 113 ItemInfo fields (pre-#276); once
+> #276's walker fixes land (110/113) the byte check gets far more
+> discriminating for free.
 
 ---
 
@@ -224,9 +239,10 @@ big win available, and the licence is clean (MIT, with attribution).
 
 ## 7. Next steps
 
-- [ ] **Build the verification harness (§4a) first.** It's cheap, it's
-      needed by every path, and it is the answer to "who's to say the rest
-      works." Nothing else here is trustworthy without it.
+- [x] **Verification harness (§4a) — DONE.** `cdumm.engine.schema_verify`
+      + `tests/test_schema_verify.py`. Any order source now runs through
+      `verify_order_source` before it is trusted. This was the answer to
+      "who's to say the rest works."
 - [ ] **Path C is the recommended durable answer**, and it is de-risked:
       the reflection metadata is unencrypted in the exe (§4). Scope the ASI
       reader-order hook. Static replay of the old schema addresses is out
