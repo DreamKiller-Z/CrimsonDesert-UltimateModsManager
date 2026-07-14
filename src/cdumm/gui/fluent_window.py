@@ -7863,25 +7863,41 @@ class CdummWindow(FluentWindow):
         pass
 
     def _check_show_update_notes(self) -> None:
-        """Show patch notes dialog when CDUMM was upgraded since the
-        last run. Stamps the new version even when the dialog isn't
-        shown so a fresh install doesn't fire on every subsequent
-        launch.
+        """Show patch notes when the newest notes changed since last run.
 
-        Skipped on a true fresh install (``last_seen_version`` is
-        unset), a brand-new user has no reason to see "what's new in
-        v3.2" for a version they just installed for the first time.
+        Keyed on a SIGNATURE of the top changelog entry, not the version
+        string alone. A community rebuild ships under the SAME version but
+        with updated notes; gating on the version left those updated notes
+        unseen in the shipped exe (AgentKush / falobos76, #191). The
+        signature changes whenever the newest entry's version OR its notes
+        change, so an updated build re-shows them and an unchanged relaunch
+        does not. A true fresh install is stamped silently -- a brand-new
+        user has no reason to see "what's new" for a version they just
+        installed. ``last_seen_version`` is still stamped for anything else
+        that reads it, and doubles as the "has run before" signal when
+        upgrading from a pre-signature build.
         """
+        import hashlib
+        import json as _json
+
         from cdumm import __version__
+        from cdumm.gui.changelog import CHANGELOG
         from cdumm.storage.config import Config
 
         config = Config(self._db)
+        top = CHANGELOG[0] if CHANGELOG else {}
+        notes_sig = hashlib.sha256(
+            _json.dumps([top.get("version", ""), top.get("notes", [])],
+                        ensure_ascii=False).encode("utf-8")).hexdigest()
+
+        last_sig = config.get("last_seen_notes_sig")
         last_ver = config.get("last_seen_version")
-        if last_ver == __version__:
+        if last_sig == notes_sig:
             return
+        config.set("last_seen_notes_sig", notes_sig)
         config.set("last_seen_version", __version__)
-        if not last_ver:
-            # Fresh install, stamp the version, don't pop the dialog.
+        if not last_sig and not last_ver:
+            # Fresh install: stamp both signals, don't pop "what's new".
             return
         try:
             from cdumm.gui.changelog import PatchNotesDialog
