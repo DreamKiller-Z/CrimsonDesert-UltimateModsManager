@@ -301,6 +301,109 @@ def verify(
     return rep.verified
 
 
+def is_convertible(json_path: Path) -> bool:
+    """Does this mod file carry byte-offset changes we could convert?
+
+    Cheap enough to call while building a context menu: no game files, no
+    table parse. Answers "should the Convert action be offered at all".
+    """
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return False
+    if data.get("format") == 3 or "intents" in data or "targets" in data:
+        return False        # already a field-name mod
+    for patch in data.get("patches", []):
+        target = (patch.get("game_file") or "").lower()
+        if not any(t in target for t in SUPPORTED_TABLES):
+            continue
+        for ch in patch.get("changes", []):
+            if isinstance(ch.get("offset"), int) and ch.get("original"):
+                return True
+    return False
+
+
+def _load_vanilla_table(game_dir: Path, name: str) -> bytes:
+    """Pull a vanilla table out of the game's PAZ archives.
+
+    CDMods/vanilla holds the PAMT indices; the .paz bodies stay in the game
+    install, so an entry resolved against the vanilla dir can point at a
+    .paz that only exists under game_dir. Map it back rather than failing.
+    """
+    from cdumm.engine.json_patch_handler import (
+        _extract_from_paz, _find_pamt_entry,
+    )
+    vanilla_dir = game_dir / "CDMods" / "vanilla"
+    entry = None
+    if vanilla_dir.exists():
+        entry = _find_pamt_entry(name, vanilla_dir)
+    if entry is None:
+        entry = _find_pamt_entry(name, game_dir)
+    if entry is None:
+        raise ConversionRefused(
+            f"{name} could not be found in your game's archives")
+    paz = Path(entry.paz_file)
+    if not paz.exists() and vanilla_dir.exists():
+        try:
+            paz = game_dir / paz.relative_to(vanilla_dir)
+        except ValueError:
+            pass
+    return _extract_from_paz(entry, str(paz))
+
+
+def convert_mod_file(
+    json_path: Path, game_dir: Path, out_path: Path,
+    mod_name: str | None = None, author: str | None = None,
+) -> ConversionReport:
+    """Convert a v2 mod file to Format 3 and write it — the whole job.
+
+    GUI-free on purpose: the worker thread calls this, and so do the tests.
+    Raises ConversionRefused (with a message written for the user) when the
+    mod can't be converted safely. Writes nothing unless the conversion
+    reproduces the original mod byte-for-byte.
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    changes: list[dict] = []
+    skipped_files: list[str] = []
+    for patch in data.get("patches", []):
+        target = (patch.get("game_file") or "").lower()
+        if any(t in target for t in SUPPORTED_TABLES):
+            changes.extend(patch.get("changes", []))
+        elif patch.get("changes"):
+            skipped_files.append(patch.get("game_file") or "?")
+
+    if not changes:
+        raise ConversionRefused(
+            "this mod has no changes CDUMM can convert yet. Only "
+            f"{', '.join(SUPPORTED_TABLES)} is supported so far — the tables "
+            "it edits are: " + (", ".join(sorted(set(skipped_files))) or "none"))
+
+    body = _load_vanilla_table(game_dir, "iteminfo.pabgb")
+    header = _load_vanilla_table(game_dir, "iteminfo.pabgh")
+
+    rep = convert_iteminfo(changes, body, header)
+    for gf in skipped_files:
+        rep.unconverted.append((
+            {"game_file": gf},
+            f"edits {gf}, which CDUMM cannot convert yet"))
+
+    verify(rep, changes, body, header)
+    if not rep.verified:
+        raise ConversionRefused(
+            "the converted mod did NOT reproduce the original byte-for-byte, "
+            "so nothing was written.\n\n" + rep.summary())
+
+    write_format3(
+        rep, out_path,
+        mod_name or json_path.stem,
+        author=author or (data.get("modinfo") or {}).get("author"),
+        source=json_path.name)
+    return rep
+
+
 def write_format3(
     rep: ConversionReport, out_path: Path, mod_name: str,
     author: str | None = None, source: str | None = None,
@@ -315,10 +418,10 @@ def write_format3(
             "title": mod_name,
             "author": author or "",
             "description": (
-                f"Converted from the byte-offset (v2) version of this mod "
-                f"by CDUMM. Field-name mods are looked up by item on every "
-                f"Apply, so this file does not need new offsets when "
-                f"Crimson Desert updates."
+                "Converted from the byte-offset (v2) version of this mod "
+                "by CDUMM. Field-name mods are looked up by item on every "
+                "Apply, so this file does not need new offsets when "
+                "Crimson Desert updates."
                 + (f" Source: {source}" if source else "")
             ),
         },

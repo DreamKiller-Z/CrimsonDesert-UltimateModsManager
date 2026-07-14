@@ -14,8 +14,8 @@ from cdumm.engine.iteminfo_native_parser import (
     detect_iteminfo_layout, parse_iteminfo_from_bytes,
 )
 from cdumm.engine.v2_to_format3 import (
-    ConversionRefused, _apply_v2, _field_spans, convert_iteminfo, verify,
-    write_format3,
+    ConversionRefused, _apply_v2, _field_spans, convert_iteminfo,
+    is_convertible, verify, write_format3,
 )
 from cdumm.semantic.parser import parse_pabgh_index
 from tests.fixture_loaders import has_vanilla113, load_vanilla113
@@ -243,3 +243,91 @@ def test_nothing_converted_writes_nothing(table, tmp_path):
     rep = convert_iteminfo([], body, header)
     with pytest.raises(ConversionRefused):
         write_format3(rep, tmp_path / "empty.field.json", "empty")
+
+
+# ── the entry point (what the GUI action actually calls) ────────────────
+
+def _v2_mod(tmp_path, changes, game_file="gamedata/iteminfo.pabgb"):
+    p = tmp_path / "mod.json"
+    p.write_text(json.dumps({
+        "format": 2,
+        "modinfo": {"title": "Infinite Durability", "author": "pinapana"},
+        "patches": [{"game_file": game_file, "changes": changes}],
+    }), encoding="utf-8")
+    return p
+
+
+def test_is_convertible_offers_the_action_only_when_it_can_deliver(tmp_path):
+    """An action that greys out or errors on half the mods is worse than no
+    action, so the menu asks this first."""
+    v2 = _v2_mod(tmp_path, [{"offset": 100, "original": "6400",
+                             "patched": "ffff"}])
+    assert is_convertible(v2) is True
+
+    f3 = tmp_path / "already.field.json"
+    f3.write_text(json.dumps({
+        "format": 3, "target": "iteminfo.pabgb",
+        "intents": [{"entry": "", "key": 1, "field": "price",
+                     "op": "set", "new": 2}],
+    }), encoding="utf-8")
+    assert is_convertible(f3) is False, "already a field-name mod"
+
+    other = _v2_mod(tmp_path, [{"offset": 1, "original": "00",
+                                "patched": "01"}],
+                    game_file="gamedata/skill.pabgb")
+    assert is_convertible(other) is False, "table CDUMM can't convert yet"
+
+    assert is_convertible(tmp_path / "nope.json") is False, "missing file"
+
+
+def test_convert_mod_file_end_to_end(table, tmp_path, monkeypatch):
+    """The seam the GUI worker calls: read a v2 mod, convert, verify, write.
+    Nothing here touches Qt -- if the entry point needed a UI to be tested,
+    it would be the wrong entry point."""
+    import cdumm.engine.v2_to_format3 as mod
+
+    body, header, *_ = table
+    key, fname, a, b, kind = _pick(table, "u16")
+    v2 = _v2_mod(tmp_path, [_change(body, a, b, (777).to_bytes(2, "little"))])
+
+    # the real loader needs a game install; the conversion itself doesn't
+    monkeypatch.setattr(
+        mod, "_load_vanilla_table",
+        lambda _g, name: body if name.endswith(".pabgb") else header)
+
+    out = tmp_path / "converted.field.json"
+    rep = mod.convert_mod_file(v2, tmp_path, out, mod_name="Infinite Durability")
+
+    assert rep.verified is True
+    assert rep.converted == 1
+    assert out.exists()
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    assert doc["format"] == 3
+    assert doc["modinfo"]["author"] == "pinapana", "author is carried over"
+    assert doc["intents"][0]["key"] == key
+    assert doc["intents"][0]["field"] == fname
+    assert doc["intents"][0]["new"] == 777
+
+
+def test_convert_mod_file_writes_nothing_when_it_cannot_verify(
+        table, tmp_path, monkeypatch):
+    """A stale mod must produce NO file. A half-written .field.json that
+    silently edits the wrong items is the whole nightmare."""
+    import cdumm.engine.v2_to_format3 as mod
+
+    body, header, *_ = table
+    key, fname, a, b, kind = _pick(table, "u16")
+    wrong = (int.from_bytes(body[a:b], "little") ^ 0xFFFF).to_bytes(2, "little")
+    v2 = _v2_mod(tmp_path, [{"offset": a, "original": wrong.hex(),
+                             "patched": "0100"}])
+
+    monkeypatch.setattr(
+        mod, "_load_vanilla_table",
+        lambda _g, name: body if name.endswith(".pabgb") else header)
+
+    out = tmp_path / "converted.field.json"
+    with pytest.raises(ConversionRefused) as e:
+        mod.convert_mod_file(v2, tmp_path, out)
+
+    assert "different version" in str(e.value)
+    assert not out.exists(), "a refused conversion must leave no file behind"
