@@ -165,6 +165,20 @@ class _Reader:
     def cstring(self) -> str:
         """Length-prefixed UTF-8 string (no trailing nul)."""
         n = self.u32()
+        # Same bound as carray: a string cannot be longer than the bytes left
+        # in its record. Without it, a speculative/optional read on a garbage
+        # length prefix (seen up to 2 GB during layout detection) slices and
+        # decodes up to the whole 5.9 MB buffer with errors="replace" BEFORE
+        # the trial backtracks. Measured on the real 1.13 table: 2.6k such
+        # reads decode ~15 GB and cost ~20s of the ~26s parse (GitHub #49).
+        # Valid strings always fit, so this never fires on real data and the
+        # parse output is byte-identical -- only the doomed trials fail faster.
+        remaining = (self.rec_end or len(self.data)) - self.pos
+        if n > remaining:
+            raise ValueError(
+                f"iteminfo cstring length {n} exceeds {remaining} remaining "
+                f"bytes at offset {self.pos}; likely a game-version layout "
+                f"shift the parser does not model yet")
         s = self.data[self.pos:self.pos + n].decode("utf-8", errors="replace")
         self.pos += n
         return s
@@ -172,6 +186,12 @@ class _Reader:
     def cstring_raw(self) -> bytes:
         """Same as cstring but return raw bytes (handles non-UTF-8)."""
         n = self.u32()
+        remaining = (self.rec_end or len(self.data)) - self.pos
+        if n > remaining:
+            raise ValueError(
+                f"iteminfo cstring length {n} exceeds {remaining} remaining "
+                f"bytes at offset {self.pos}; likely a game-version layout "
+                f"shift the parser does not model yet")
         b = self.data[self.pos:self.pos + n]
         self.pos += n
         return b
