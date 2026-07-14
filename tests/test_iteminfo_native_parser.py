@@ -29,71 +29,83 @@ def _have_live_fixture() -> bool:
     return _LIVE_BODY.exists()
 
 
+def _layout_and_index():
+    """The layout this fixture is actually in, plus its record offsets."""
+    from cdumm.engine.iteminfo_native_parser import detect_iteminfo_layout
+    from cdumm.semantic.parser import parse_pabgh_index
+
+    body = _LIVE_BODY.read_bytes()
+    header = _LIVE_BODY.with_suffix(".pabgh").read_bytes()
+    _, offsets = parse_pabgh_index(header, "iteminfo")
+    starts = sorted(offsets.values())
+    fields = detect_iteminfo_layout(body, starts)
+    assert fields is not None, "no iteminfo layout round-trips this fixture"
+    return body, offsets, starts, fields
+
+
 @pytest.mark.skipif(
     not _have_live_fixture(),
-    reason="iteminfo_postpatch.pabgb fixture not present",
+    reason="CD 1.13 iteminfo fixture not present",
 )
-@pytest.mark.skip(
-    reason="pins the default-layout parser API (parse_first_record_size / parse_record_at take no field list) against a table that is not in the module-default layout. Neither committed fixture is: CD 1.13 needs the cd113 layout, CD 1.10 has no layout that round-trips. The version-adaptive path these functions predate is covered by test_iteminfo_cd113_enchant.py and test_iteminfo_walk_real_game.py. Was previously skipped via a hardcoded C:/Users/faisa/... path, which hid this.")
 def test_native_parser_first_record_size_matches_pabgh_index():
-    """Parse the first record from the live iteminfo. Its on-disk
-    size must equal what the .pabgh index says (offset of record 1
-    minus offset of record 0). Catches schema-misalignment where
-    the parser walks fewer or more bytes than the actual record.
+    """The first record's on-disk size must equal what the .pabgh index
+    says (offset of record 1 minus record 0). Catches misalignment where
+    the parser walks fewer or more bytes than the record really occupies.
+
+    Was permanently skipped: it called the parser without a layout, so it
+    could only ever pass against the module default -- a 1.11-era shape no
+    committed fixture is in. The invariant is real, so the parser learned
+    to take a layout rather than the test being deleted.
     """
     from cdumm.engine.iteminfo_native_parser import parse_first_record_size
 
-    body = _LIVE_BODY.read_bytes()
-    header = _LIVE_BODY.with_suffix(".pabgh").read_bytes()
+    body, offsets, starts, fields = _layout_and_index()
+    expected = starts[1] - starts[0]
 
-    from cdumm.semantic.parser import parse_pabgh_index
-    _, offsets = parse_pabgh_index(header, "iteminfo")
-    sorted_offs = sorted(offsets.items(), key=lambda kv: kv[1])
-    expected_first_size = sorted_offs[1][1] - sorted_offs[0][1]
-
-    actual = parse_first_record_size(body)
-    assert actual == expected_first_size, (
-        f"first record size: parser walked {actual} bytes, "
-        f"pabgh index says {expected_first_size} bytes")
+    actual = parse_first_record_size(body, fields=fields)
+    assert actual == expected, (
+        f"first record: parser walked {actual} bytes, "
+        f"the .pabgh index says {expected}")
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(
     not _have_live_fixture(),
-    reason="iteminfo_postpatch.pabgb fixture not present",
+    reason="CD 1.13 iteminfo fixture not present",
 )
-@pytest.mark.skip(
-    reason="pins the default-layout parser API (parse_first_record_size / parse_record_at take no field list) against a table that is not in the module-default layout. Neither committed fixture is: CD 1.13 needs the cd113 layout, CD 1.10 has no layout that round-trips. The version-adaptive path these functions predate is covered by test_iteminfo_cd113_enchant.py and test_iteminfo_walk_real_game.py. Was previously skipped via a hardcoded C:/Users/faisa/... path, which hid this.")
 def test_native_parser_walks_every_record_to_correct_boundary():
-    """For every entry in the .pabgh index, our parser's walked
-    size must equal (next_offset - this_offset). One drift on any
-    record means we'd serialize-corrupt the file."""
+    """For EVERY record in the index, the parser's walked size must equal
+    (next_offset - this_offset). One drift on one record and serializing
+    corrupts the file.
+
+    This is the strictest statement of the 1.13 decode being complete: a
+    record whose fields we don't fully understand stops short of its
+    boundary and the leftover is carried as opaque `_tail_slack`. Zero
+    drift means zero opaque tail -- which is exactly what #285 was about
+    (76-139 bytes per record silently carried through, undecoded, while a
+    whole-table round-trip stayed byte-perfect and said nothing).
+    """
     from cdumm.engine.iteminfo_native_parser import parse_record_at
 
-    body = _LIVE_BODY.read_bytes()
-    header = _LIVE_BODY.with_suffix(".pabgh").read_bytes()
-
-    from cdumm.semantic.parser import parse_pabgh_index
-    _, offsets = parse_pabgh_index(header, "iteminfo")
-    sorted_offs = sorted(offsets.items(), key=lambda kv: kv[1])
+    body, offsets, starts, fields = _layout_and_index()
+    by_start = {off: k for k, off in offsets.items()}
 
     drifts: list[tuple[int, int, int]] = []
-    for i, (key, off) in enumerate(sorted_offs):
-        end = (sorted_offs[i + 1][1]
-               if i + 1 < len(sorted_offs) else len(body))
+    for i, off in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(body)
         expected = end - off
         try:
-            actual = parse_record_at(body, off, rec_end=end) - off
-        except Exception as e:
-            drifts.append((key, expected, -1))
-            if len(drifts) <= 3:
-                print(f"key={key} off=0x{off:X}: parse failed: {e}")
+            actual = parse_record_at(body, off, rec_end=end,
+                                     fields=fields) - off
+        except Exception:
+            drifts.append((by_start[off], expected, -1))
             continue
         if actual != expected:
-            drifts.append((key, expected, actual))
+            drifts.append((by_start[off], expected, actual))
 
     assert not drifts, (
-        f"{len(drifts)}/{len(sorted_offs)} records misaligned. "
-        f"first 3: {drifts[:3]}")
+        f"{len(drifts)}/{len(starts)} records do not walk to their index "
+        f"boundary (key, expected, walked): {drifts[:3]}")
 
 
 @pytest.mark.skipif(

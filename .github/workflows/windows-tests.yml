@@ -27,6 +27,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  lint:
+    name: lint (ruff)
+    # CI never ran ruff at all, so lint findings only surfaced when someone
+    # happened to run it locally. This job lints the files a PR actually
+    # TOUCHES rather than the whole tree: apply_engine.py alone carries 18
+    # pre-existing findings, and failing every PR on debt it didn't create
+    # teaches people to ignore the linter -- which is worse than not having
+    # one. New code is held to a clean bar; the backlog gets paid down
+    # separately.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install ruff
+        run: python -m pip install ruff
+      - name: Lint the files this change touches
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            base="origin/${GITHUB_BASE_REF}"
+            git fetch --no-tags --depth=50 origin "${GITHUB_BASE_REF}"
+          else
+            base="HEAD~1"
+          fi
+          files=$(git diff --name-only --diff-filter=ACMR "${base}"...HEAD -- '*.py' || true)
+          if [ -z "${files}" ]; then
+            echo "no Python files changed"
+            exit 0
+          fi
+          echo "linting:"; echo "${files}"
+          ruff check ${files}
+
   test:
     name: fast tests
     # All ~1,900 fast tests run as ONE pytest-xdist job. Sharding them across
@@ -55,10 +94,19 @@ jobs:
 
   slow-tests:
     name: slow integration tests
-    # Heavy full-table round-trips. Run on master, nightly, and on demand
-    # -- not on every PR, to keep PR feedback fast. Trigger manually on a
-    # PR that touches the iteminfo parser/writer.
-    if: github.event_name == 'schedule' || github.event_name == 'push'
+    # Heavy full-table round-trips against the REAL 1.13 game table.
+    #
+    # These used to skip on pull requests (schedule/push only), which meant a
+    # PR could be merged green having never touched the real table -- and the
+    # real table is where this project's worst bugs live: #285 (76-139 bytes
+    # per record carried through undecoded), #293 (byte offsets written into
+    # the middle of another record, corrupting the file). A gate that cannot
+    # catch the class of bug that actually ships is not a gate.
+    #
+    # They now run on PRs too. Fast feedback is unaffected: this job runs in
+    # PARALLEL with the ~4-minute fast job, so a green tick still arrives
+    # quickly; only the merge signal waits. Runner minutes are a cheaper
+    # currency than a corrupted save.
     runs-on: windows-latest
     timeout-minutes: 35
     steps:

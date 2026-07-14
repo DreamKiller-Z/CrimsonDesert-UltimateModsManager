@@ -422,16 +422,23 @@ def serialize_iteminfo(
     return bytes(w.buf)
 
 
-def parse_first_record_size(data: bytes) -> int:
+def parse_first_record_size(data: bytes, fields=None) -> int:
     """Parse the first record and return its byte size. Used by the
-    test suite as a faster check than full-file round-trip."""
+    test suite as a faster check than full-file round-trip.
+
+    ``fields`` takes the layout ``detect_iteminfo_layout`` selected. Without
+    it these helpers assumed the module default -- which matched exactly one
+    maintainer's 1.11-era extract and desyncs on every committed table. Two
+    boundary tests were permanently skipped for that reason; the invariant
+    they pin is real, so the API grew a layout instead of the tests dying.
+    """
     r = _Reader(data, 0)
-    _read_item(r)
+    _read_item(r, fields=fields)
     return r.pos
 
 
 def parse_record_at(
-    data: bytes, offset: int, rec_end: int | None = None
+    data: bytes, offset: int, rec_end: int | None = None, fields=None
 ) -> int:
     """Parse one record starting at ``offset`` and return the cursor
     position after the record. Test helper for boundary checks.
@@ -440,9 +447,11 @@ def parse_record_at(
     threaded through the reader so forward-walk fallbacks cap their
     needle search at the record boundary instead of latching onto the
     next record's GVP entry.
+
+    ``fields`` is the layout for this game version (see above).
     """
     r = _Reader(data, offset, rec_end=rec_end)
-    _read_item(r)
+    _read_item(r, fields=fields)
     return r.pos
 
 
