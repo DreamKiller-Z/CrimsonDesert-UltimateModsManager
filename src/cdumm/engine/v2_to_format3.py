@@ -113,9 +113,14 @@ def _field_spans(record: dict, layout, base: int) -> dict[str, tuple]:
     inverse of the reader, so the byte each field occupies is exactly
     where the reader found it.
     """
-    from cdumm.engine.iteminfo_native_parser import _Writer, _write_item
+    from cdumm.engine.iteminfo_native_parser import (
+        _reorder_equip_tail, _Writer, _write_item,
+    )
     w = _Writer()
     out: dict[str, tuple] = {}
+    # Walk in the record's effective field order so per-field spans match how
+    # the writer lays the bytes out (the type_id==0 cooltime reorder, #191).
+    layout = _reorder_equip_tail(layout, record)
     for spec in layout:
         a = len(w.buf)
         try:
@@ -210,36 +215,58 @@ def convert_iteminfo(
             spans = _field_spans(rec, layout, rec_start)
             spans_cache[i] = spans
 
-        hit = None
-        for fname, (a, b, kind) in spans.items():
-            if a <= off and off + len(orig) <= b:
-                hit = (fname, a, b, kind)
-                break
-        if hit is None:
+        # Which named field(s) does this change land on?
+        end = off + len(orig)
+        single = next(((fn, a, b, k) for fn, (a, b, k) in spans.items()
+                       if a <= off and end <= b), None)
+        if single is not None:
+            segments = [single]
+        else:
+            # Multi-field: accept only when the change EXACTLY tiles a run of
+            # complete, consecutive fields -- e.g. the thief gloves' one write
+            # covers cooltime + unk_post_cooltime_a + unk_post_cooltime_b (three
+            # i64s) in a single 24-byte blob (#191). Split it into one intent
+            # per field. A change that starts or ends mid-field does NOT tile
+            # and is left unconverted rather than guessed.
+            cov = sorted((a, b, k, fn) for fn, (a, b, k) in spans.items()
+                         if off <= a and b <= end)
+            if (cov and cov[0][0] == off and cov[-1][1] == end
+                    and all(cov[j][1] == cov[j + 1][0]
+                            for j in range(len(cov) - 1))):
+                segments = [(fn, a, b, k) for a, b, k, fn in cov]
+            else:
+                segments = []
+        if not segments:
             rep.unconverted.append((
                 ch, "lands between named fields (CDUMM cannot say which "
                     "field this is on your game version)"))
             continue
 
-        fname, a, b, kind = hit
-        if fname in _STRUCTURAL:
-            rep.unconverted.append((
-                ch, "rewrites the item's ID, which a field-name mod "
-                    "addresses items BY and therefore cannot change"))
+        bad = False
+        for fname, a, b, kind in segments:
+            if fname in _STRUCTURAL:
+                rep.unconverted.append((
+                    ch, "rewrites the item's ID, which a field-name mod "
+                        "addresses items BY and therefore cannot change"))
+                bad = True
+                break
+            if kind not in _SCALARS:
+                rep.unconverted.append((
+                    ch, f"'{fname}' is a {kind}, which has no single value "
+                        f"to set"))
+                bad = True
+                break
+            # (3) a change may write only part of a field. Overlay this
+            #     change's slice onto the field's current bytes and decode
+            #     the WHOLE field, so the intent carries the real value.
+            s = max(off, a)
+            e = min(end, b)
+            cur = bytearray(staged.get((key, fname), (None,))[0]
+                            or vanilla_body[a:b])
+            cur[s - a:e - a] = new[s - off:e - off]
+            staged[(key, fname)] = (bytes(cur), a, b, kind)
+        if bad:
             continue
-        if kind not in _SCALARS:
-            rep.unconverted.append((
-                ch, f"'{fname}' is a {kind}, which has no single value to "
-                    f"set"))
-            continue
-
-        # (3) a change may write only part of the field. Overlay it onto
-        #     the field's current bytes and decode the WHOLE field, so
-        #     the intent carries the real resulting value.
-        cur = bytearray(staged.get((key, fname), (None,))[0]
-                        or vanilla_body[a:b])
-        cur[off - a:off - a + len(new)] = new
-        staged[(key, fname)] = (bytes(cur), a, b, kind)
 
     for (key, fname), (raw, a, b, kind) in staged.items():
         val = _decode(kind, raw)

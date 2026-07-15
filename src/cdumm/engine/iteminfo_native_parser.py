@@ -2278,12 +2278,52 @@ def detect_iteminfo_layout(data: bytes, record_offsets):
     return best_fields
 
 
+def _reorder_equip_tail(fields, record):
+    """Effective field order for the equipment tail of one record.
+
+    For the ``default_sub_item.type_id == 0`` shape, ``item_charge_type`` (a u8)
+    sits BEFORE ``cooltime``, not after ``unk_post_cooltime_b``. Return ``fields``
+    with the ``item_charge_type`` spec moved to just before ``cooltime`` for that
+    shape; otherwise return ``fields`` unchanged.
+
+    Empirically derived on the real 1.13 table (thief gloves / falobos76 #191):
+    every type_id==0 record reads a sensible cooltime ONLY in this order
+    (390/390) and every other record ONLY in the flat order (6118/6118).
+    Confirmed byte-exact and against DMM + the gloves mod (item 1001250,
+    cooltime 1,800,000). The writer and the converter's field-span walker both
+    call this so read, write and span attribution stay in one order.
+    """
+    dsi = record.get("default_sub_item")
+    if not isinstance(dsi, dict) or dsi.get("type_id", 15) != 0:
+        return fields
+    names = [f[0] for f in fields]
+    if "cooltime" not in names or "item_charge_type" not in names:
+        return fields
+    if names.index("item_charge_type") < names.index("cooltime"):
+        return fields                       # already reordered (defensive)
+    ict = next(f for f in fields if f[0] == "item_charge_type")
+    out = [f for f in fields if f[0] != "item_charge_type"]
+    out.insert([f[0] for f in out].index("cooltime"), ict)
+    return out
+
+
 def _read_item(r: _Reader, fields=None) -> dict:
     out: dict = {}
     if fields is None:
         fields = _ITEM_FIELDS
     for spec in fields:
         name, kind = spec[0], spec[1]
+        # Cooltime reorder (thief gloves / falobos76 #191): mirror of
+        # _reorder_equip_tail for the read path, which can't reorder up front
+        # because type_id isn't known until default_sub_item is read. For the
+        # type_id==0 shape, item_charge_type (u8) precedes cooltime -- read it
+        # here and skip its later slot so the bytes consumed match what
+        # _write_item (which DOES reorder) emits.
+        if (out.get("default_sub_item") or {}).get("type_id", 15) == 0:
+            if name == "cooltime":
+                out["item_charge_type"] = r.u8()
+            elif name == "item_charge_type":
+                continue
         # Conditional 12-byte block before item_desc on lantern records.
         if name == "item_desc" and out.get("equip_type_info") == LANTERN_EQ_TYPE:
             out["lantern_unk_a"] = r.u32()
@@ -2470,6 +2510,11 @@ def _write_item(w: _Writer, it: dict, fields=None) -> None:
         return
     if fields is None:
         fields = _ITEM_FIELDS
+    # Cooltime reorder (thief gloves / falobos76 #191): item_charge_type sits
+    # before cooltime for the type_id==0 shape. Reorder the field list so a
+    # full-record write emits that order; a single-field call from
+    # _field_spans is a no-op here (both fields aren't present together).
+    fields = _reorder_equip_tail(fields, it)
     for spec in fields:
         name, kind = spec[0], spec[1]
         # Symmetric lantern conditional: emit 12 bytes only when
