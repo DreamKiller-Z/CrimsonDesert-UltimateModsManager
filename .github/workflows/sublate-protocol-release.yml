@@ -75,6 +75,7 @@ jobs:
             tests/test_sublate_protocol_cli.py `
             tests/test_release_evidence.py `
             tests/test_source_tree_archive.py `
+            tests/test_source_tree_patch.py `
             tests/test_mod_manager.py `
             -q
 
@@ -100,13 +101,11 @@ jobs:
             --commit "$env:SOURCE_COMMIT" `
             --archive "dist/cdumm-source.zip" `
             --prefix "CDUMM-$env:GITHUB_REF_NAME/"
-          git diff `
-            --binary `
-            "$env:UPSTREAM_BASE_COMMIT" `
-            "$env:SOURCE_COMMIT" |
-            Out-File `
-              -LiteralPath "dist/cdumm-upstream.patch" `
-              -Encoding utf8NoBOM
+          python scripts/source_tree_patch.py create `
+            --repository . `
+            --base "$env:UPSTREAM_BASE_COMMIT" `
+            --source "$env:SOURCE_COMMIT" `
+            --patch "dist/cdumm-upstream.patch"
           cyclonedx-py environment `
             --output-format JSON `
             --output-reproducible `
@@ -123,6 +122,15 @@ jobs:
             --commit "$env:SOURCE_COMMIT" `
             --archive "dist/cdumm-source.zip" `
             --prefix "CDUMM-$env:GITHUB_REF_NAME/"
+
+      - name: Verify upstream patch reproduces the exact source tree
+        shell: pwsh
+        run: |
+          python scripts/source_tree_patch.py verify `
+            --repository . `
+            --base "$env:UPSTREAM_BASE_COMMIT" `
+            --source "$env:SOURCE_COMMIT" `
+            --patch "dist/cdumm-upstream.patch"
 
       - name: Record dependency, Defender, and Authenticode results
         shell: pwsh
