@@ -21,7 +21,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     env:
-      PYTHON_VERSION: "3.12.13"
+      PYTHON_VERSION: "3.12.10"
       UPSTREAM_BASE_COMMIT: "b3caa88b1228aa21e93e0025dd6ce4207725e3d4"
 
     steps:
