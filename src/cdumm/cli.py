@@ -1,7 +1,8 @@
 """Headless CLI for CDUMM — used by external tools (crash monitor, scripts).
 
 Commands:
-    CDUMM.exe list-mods [--json]
+    CDUMM.exe list-mods --read-only [--json]
+    CDUMM.exe remove-mod --mod-id ID --game-dir PATH
     CDUMM.exe set-enabled --mod-id ID --enabled true|false
     CDUMM.exe apply [--game-dir PATH]
     CDUMM.exe cleanup-duplicates [--dry-run] [--game-dir PATH]
@@ -9,6 +10,7 @@ Commands:
 import argparse
 import json
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -16,6 +18,100 @@ from cdumm.engine.cdmods_paths import get_cdmods_root
 from cdumm.platform import IS_WINDOWS, app_data_dir
 
 APP_DATA_DIR = app_data_dir()
+
+
+class _ExistingDatabase:
+    """Minimal database adapter for a schema that already exists on disk.
+
+    Protocol commands deliberately do not call :class:`Database.initialize`:
+    initialization creates directories, runs migrations, creates indexes, and
+    trims the activity log.  Those are appropriate application-startup side
+    effects, but they violate the external protocol's promise that inventory
+    reads and rejected removals do not mutate manager state.
+
+    The adapter exposes the ``connection`` and ``close`` surface consumed by
+    ``Config`` and ``ModManager`` while making the chosen SQLite access mode
+    explicit at construction time.
+    """
+
+    def __init__(self, db_path: Path, *, read_only: bool) -> None:
+        """Open ``db_path`` without creating or migrating it.
+
+        Read-only connections use SQLite's URI ``mode=ro`` and also set
+        ``query_only`` as defense in depth.  Writable connections are only
+        created after a separate read-only preflight has proved that a remove
+        target exists and is already disabled.
+        """
+        self.db_path = db_path
+        if read_only:
+            uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            self._connection = sqlite3.connect(uri, uri=True)
+            self._connection.execute("PRAGMA query_only=ON")
+            query_only = self._connection.execute(
+                "PRAGMA query_only"
+            ).fetchone()
+            if not query_only or query_only[0] != 1:
+                self._connection.close()
+                raise sqlite3.OperationalError(
+                    "SQLite refused query_only mode"
+                )
+        else:
+            uri = f"{db_path.resolve().as_uri()}?mode=rw"
+            self._connection = sqlite3.connect(uri, uri=True)
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            self._connection.execute("PRAGMA busy_timeout=5000")
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Return the already-open connection expected by domain services."""
+        return self._connection
+
+    def close(self) -> None:
+        """Close the protocol connection without running shutdown writes."""
+        self._connection.close()
+
+
+def _protocol_json(payload: dict) -> str:
+    """Serialize a protocol response with deterministic key ordering."""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _exit_protocol_error(code: str, message: str, exit_code: int) -> None:
+    """Emit a path-free machine-readable error and terminate non-zero.
+
+    Raw SQLite and filesystem exceptions can contain absolute tester paths.
+    Protocol callers therefore receive a bounded error code and message while
+    detailed diagnostics remain available to an interactive developer through
+    a debugger or targeted test.
+    """
+    print(
+        _protocol_json({
+            "error": {"code": code, "message": message},
+            "ok": False,
+        }),
+        file=sys.stderr,
+    )
+    raise SystemExit(exit_code)
+
+
+def _positive_mod_id(value: str) -> int:
+    """Parse a strictly positive mod ID before any command side effect."""
+    try:
+        mod_id = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "mod ID must be a positive integer"
+        ) from exc
+    if mod_id <= 0:
+        raise argparse.ArgumentTypeError(
+            "mod ID must be a positive integer"
+        )
+    return mod_id
 
 
 def _cdmods_root(game_dir: Path, db=None) -> Path:
@@ -75,41 +171,187 @@ def _open_db(game_dir: Path):
     return db
 
 
+def _existing_db_path(game_dir: Path) -> Path:
+    """Resolve the existing manager database without creating directories."""
+    return get_cdmods_root(None, game_dir) / "cdumm.db"
+
+
+def _open_existing_db(
+    game_dir: Path,
+    *,
+    read_only: bool,
+) -> _ExistingDatabase:
+    """Open the existing manager database in the requested protocol mode."""
+    db_path = _existing_db_path(game_dir)
+    if not db_path.is_file():
+        raise FileNotFoundError("CDUMM database is unavailable")
+    return _ExistingDatabase(db_path, read_only=read_only)
+
+
 def cmd_list_mods(args):
+    """List manager inventory through a mandatory read-only SQLite session."""
     game_dir = _resolve_game_dir(args.game_dir)
     if not game_dir:
-        print("Error: cannot find game directory. Use --game-dir.", file=sys.stderr)
-        sys.exit(1)
+        _exit_protocol_error(
+            "game_dir_unavailable",
+            "Cannot find game directory; provide --game-dir.",
+            1,
+        )
 
-    db = _open_db(game_dir)
-    from cdumm.engine.mod_manager import ModManager
-    mgr = ModManager(db, _cdmods_root(game_dir, db) / "deltas")
-    mods = mgr.list_mods(args.type)
+    try:
+        db = _open_existing_db(game_dir, read_only=True)
+    except (FileNotFoundError, OSError, sqlite3.Error):
+        _exit_protocol_error(
+            "database_unavailable",
+            "CDUMM database is unavailable.",
+            1,
+        )
 
-    if args.json:
-        out = []
-        for m in mods:
-            entry = {
-                "id": m["id"],
-                "name": m["name"],
-                "mod_type": m["mod_type"],
-                "enabled": m["enabled"],
-                "priority": m["priority"],
-            }
-            if args.status:
-                entry["status"] = mgr.get_mod_game_status(m["id"], game_dir)
-            out.append(entry)
-        print(json.dumps(out, indent=2))
-    else:
-        for m in mods:
-            if args.status:
-                game_status = mgr.get_mod_game_status(m["id"], game_dir)
-                print(f"[{game_status:>12s}] #{m['id']:>3d}  {m['name']}  ({m['mod_type']})")
-            else:
-                status = "ON " if m["enabled"] else "OFF"
-                print(f"[{status}] #{m['id']:>3d}  {m['name']}  ({m['mod_type']})")
+    try:
+        from cdumm.engine.mod_manager import ModManager
+        mgr = ModManager(db, _cdmods_root(game_dir, db) / "deltas")
+        mods = mgr.list_mods(args.type)
 
-    db.close()
+        if args.json:
+            out = []
+            for m in mods:
+                entry = {
+                    "id": m["id"],
+                    "name": m["name"],
+                    "mod_type": m["mod_type"],
+                    "enabled": m["enabled"],
+                    "priority": m["priority"],
+                }
+                if args.status:
+                    entry["status"] = mgr.get_mod_game_status(
+                        m["id"], game_dir
+                    )
+                out.append(entry)
+            print(json.dumps(out, indent=2))
+        else:
+            for m in mods:
+                if args.status:
+                    game_status = mgr.get_mod_game_status(
+                        m["id"], game_dir
+                    )
+                    print(
+                        f"[{game_status:>12s}] #{m['id']:>3d}  "
+                        f"{m['name']}  ({m['mod_type']})"
+                    )
+                else:
+                    status = "ON " if m["enabled"] else "OFF"
+                    print(
+                        f"[{status}] #{m['id']:>3d}  "
+                        f"{m['name']}  ({m['mod_type']})"
+                    )
+    except sqlite3.Error:
+        _exit_protocol_error(
+            "inventory_read_failed",
+            "CDUMM inventory could not be read.",
+            5,
+        )
+    finally:
+        db.close()
+
+
+def cmd_remove_mod(args):
+    """Remove one already-disabled mod using the existing domain operation.
+
+    The read-only preflight rejects absent and enabled rows before any writable
+    SQLite connection is opened.  The second validation happens under
+    ``BEGIN IMMEDIATE`` so another process cannot enable the mod between the
+    check and ``ModManager.remove_mod``.  Filesystem failures leave the row in
+    place, making a retry converge without touching unrelated mod state.
+    """
+    game_dir = _resolve_game_dir(args.game_dir)
+    if not game_dir:
+        _exit_protocol_error(
+            "game_dir_unavailable",
+            "Cannot find game directory; provide --game-dir.",
+            1,
+        )
+
+    try:
+        inspection_db = _open_existing_db(game_dir, read_only=True)
+        try:
+            row = inspection_db.connection.execute(
+                "SELECT name, enabled FROM mods WHERE id = ?",
+                (args.mod_id,),
+            ).fetchone()
+        finally:
+            inspection_db.close()
+    except (FileNotFoundError, OSError, sqlite3.Error):
+        _exit_protocol_error(
+            "database_unavailable",
+            "CDUMM database is unavailable.",
+            1,
+        )
+
+    if row is None:
+        print(_protocol_json({
+            "action": "already_absent",
+            "mod_id": args.mod_id,
+            "ok": True,
+        }))
+        return
+    if bool(row[1]):
+        _exit_protocol_error(
+            "mod_enabled",
+            "Disable and apply or revert the mod before removal.",
+            4,
+        )
+
+    from cdumm.engine.mod_manager import (
+        ModManager,
+        ModMustBeDisabledError,
+        ModNotFoundError,
+    )
+
+    db = None
+    try:
+        db = _open_existing_db(game_dir, read_only=False)
+        db.connection.execute("BEGIN IMMEDIATE")
+        mgr = ModManager(db, _cdmods_root(game_dir, db) / "deltas")
+        mgr.remove_mod(
+            args.mod_id,
+            require_existing=True,
+            require_disabled=True,
+        )
+    except ModNotFoundError:
+        if db is not None:
+            db.connection.rollback()
+        print(_protocol_json({
+            "action": "already_absent",
+            "mod_id": args.mod_id,
+            "ok": True,
+        }))
+        return
+    except ModMustBeDisabledError:
+        if db is not None:
+            db.connection.rollback()
+        _exit_protocol_error(
+            "mod_enabled",
+            "Disable and apply or revert the mod before removal.",
+            4,
+        )
+    except (OSError, sqlite3.Error):
+        if db is not None:
+            db.connection.rollback()
+        _exit_protocol_error(
+            "remove_failed",
+            "The mod could not be removed; manager state is retryable.",
+            5,
+        )
+    finally:
+        if db is not None:
+            db.close()
+
+    print(_protocol_json({
+        "action": "removed",
+        "mod_id": args.mod_id,
+        "name": row[0],
+        "ok": True,
+    }))
 
 
 def cmd_set_enabled(args):
@@ -520,10 +762,36 @@ def main():
 
     # list-mods
     p_list = sub.add_parser("list-mods", help="List mods")
+    p_list.add_argument(
+        "--read-only",
+        action="store_true",
+        required=True,
+        help=(
+            "Required protocol guard: open SQLite with mode=ro and "
+            "query_only=ON"
+        ),
+    )
     p_list.add_argument("--json", action="store_true", help="Output as JSON")
     p_list.add_argument("--status", action="store_true", help="Include game file status (active/not applied)")
     p_list.add_argument("--type", default=None, help="Filter by mod_type (paz, asi)")
     p_list.add_argument("--game-dir", default=None, help="Game directory override")
+
+    # remove-mod
+    p_remove = sub.add_parser(
+        "remove-mod",
+        help="Remove one already-disabled mod from manager-owned state",
+    )
+    p_remove.add_argument(
+        "--mod-id",
+        type=_positive_mod_id,
+        required=True,
+        help="Positive mod ID",
+    )
+    p_remove.add_argument(
+        "--game-dir",
+        required=True,
+        help="Game directory override",
+    )
 
     # set-enabled
     p_set = sub.add_parser("set-enabled", help="Enable or disable a mod")
@@ -561,6 +829,8 @@ def main():
 
     if args.command == "list-mods":
         cmd_list_mods(args)
+    elif args.command == "remove-mod":
+        cmd_remove_mod(args)
     elif args.command == "set-enabled":
         cmd_set_enabled(args)
     elif args.command == "apply":

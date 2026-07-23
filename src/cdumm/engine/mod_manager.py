@@ -10,6 +10,18 @@ from cdumm.storage.database import Database
 logger = logging.getLogger(__name__)
 
 
+class ModRemovalError(RuntimeError):
+    """Base error for a removal rejected before manager state changes."""
+
+
+class ModNotFoundError(ModRemovalError):
+    """Raised when strict removal requires a registry row that is absent."""
+
+
+class ModMustBeDisabledError(ModRemovalError):
+    """Raised when strict removal finds a mod that is still enabled."""
+
+
 class ModManager:
     """Manages the mod registry: list, enable/disable, remove, metadata."""
 
@@ -128,15 +140,35 @@ class ModManager:
         self._db.connection.commit()
         logger.info("Mod %d %s", mod_id, "enabled" if enabled else "disabled")
 
-    def remove_mod(self, mod_id: int) -> None:
+    def remove_mod(
+        self,
+        mod_id: int,
+        *,
+        require_existing: bool = False,
+        require_disabled: bool = False,
+    ) -> None:
         """Remove a mod and its deltas from the manager.
 
         Files are NOT reverted here — the caller must Apply after removing
         to revert game files. We disable the mod first and keep its delta
         entries until after the next Apply reverts them, then clean up.
+
+        ``require_existing`` and ``require_disabled`` define the strict
+        external-protocol mode.  Both checks run before a database update or
+        filesystem deletion, and callers can hold ``BEGIN IMMEDIATE`` while
+        invoking this method to keep the validation and deletion serialized.
+        Existing GUI callers retain the historical forgiving behavior because
+        both options default to ``False``.
         """
         cursor = self._db.connection.execute("SELECT name, enabled FROM mods WHERE id = ?", (mod_id,))
         row = cursor.fetchone()
+        if row is None and require_existing:
+            raise ModNotFoundError(f"mod {mod_id} does not exist")
+        if row is not None and bool(row[1]) and require_disabled:
+            raise ModMustBeDisabledError(
+                f"mod {mod_id} must be disabled before removal"
+            )
+
         mod_name = row[0] if row else f"Mod {mod_id}"
         was_enabled = bool(row[1]) if row else False
 
@@ -158,7 +190,7 @@ class ModManager:
         # re-import cycles and collide with re-imports at the same name.
         sources_dir = self._deltas_dir.parent / "sources" / str(mod_id)
         if sources_dir.exists():
-            shutil.rmtree(sources_dir, ignore_errors=True)
+            shutil.rmtree(sources_dir)
 
         # Delete from DB (cascade removes mod_deltas and conflicts)
         self._db.connection.execute("DELETE FROM mods WHERE id = ?", (mod_id,))
