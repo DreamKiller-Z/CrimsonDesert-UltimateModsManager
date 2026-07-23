@@ -74,6 +74,7 @@ jobs:
           python -m pytest `
             tests/test_sublate_protocol_cli.py `
             tests/test_release_evidence.py `
+            tests/test_source_tree_archive.py `
             tests/test_mod_manager.py `
             -q
 
@@ -94,11 +95,11 @@ jobs:
       - name: Produce source, patch, and CycloneDX evidence
         shell: pwsh
         run: |
-          git archive `
-            --format=zip `
-            --prefix="CDUMM-$env:GITHUB_REF_NAME/" `
-            --output="dist/cdumm-source.zip" `
-            "$env:SOURCE_COMMIT"
+          python scripts/source_tree_archive.py create `
+            --repository . `
+            --commit "$env:SOURCE_COMMIT" `
+            --archive "dist/cdumm-source.zip" `
+            --prefix "CDUMM-$env:GITHUB_REF_NAME/"
           git diff `
             --binary `
             "$env:UPSTREAM_BASE_COMMIT" `
@@ -113,6 +114,15 @@ jobs:
           python scripts/enrich_release_sbom.py `
             --input "dist/cdumm-sbom.cdx.json" `
             --repository-root .
+
+      - name: Verify source archive bytes against the Git tree
+        shell: pwsh
+        run: |
+          python scripts/source_tree_archive.py verify `
+            --repository . `
+            --commit "$env:SOURCE_COMMIT" `
+            --archive "dist/cdumm-source.zip" `
+            --prefix "CDUMM-$env:GITHUB_REF_NAME/"
 
       - name: Record dependency, Defender, and Authenticode results
         shell: pwsh
