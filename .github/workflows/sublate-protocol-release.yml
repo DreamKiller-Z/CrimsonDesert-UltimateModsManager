@@ -1,0 +1,329 @@
+name: Sublate protocol release
+
+# This workflow is the only supported acquisition route for the bounded
+# Sublate CDUMM fork. A tag selects one immutable source commit, the committed
+# hash lock selects every Python dependency, and GitHub artifact attestations
+# bind the resulting executable and SBOM back to this workflow invocation.
+on:
+  push:
+    tags:
+      - "sublate-cdumm-v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-release:
+    name: Build, test, attest, and release Windows x86_64
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      PYTHON_VERSION: "3.12.13"
+      UPSTREAM_BASE_COMMIT: "b3caa88b1228aa21e93e0025dd6ce4207725e3d4"
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and verify source lineage
+        shell: pwsh
+        run: |
+          $sourceCommit = (git rev-parse HEAD).Trim()
+          git merge-base `
+            --is-ancestor `
+            "$env:UPSTREAM_BASE_COMMIT" `
+            "$sourceCommit"
+          if ($LASTEXITCODE -ne 0) {
+            throw "tag source is not descended from the pinned upstream base"
+          }
+          "SOURCE_COMMIT=$sourceCommit" |
+            Out-File `
+              -FilePath $env:GITHUB_ENV `
+              -Encoding utf8 `
+              -Append
+
+      - name: Set up exact Python toolchain
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-release.lock
+
+      - name: Install only hash-locked release dependencies
+        shell: pwsh
+        run: |
+          python -m pip install `
+            --require-hashes `
+            --only-binary=:all: `
+            --disable-pip-version-check `
+            -r requirements-release.lock
+          python -m pip install `
+            --no-build-isolation `
+            --no-deps `
+            --disable-pip-version-check `
+            .
+
+      - name: Run supported protocol contract tests
+        shell: pwsh
+        run: |
+          python -m pytest `
+            tests/test_sublate_protocol_cli.py `
+            tests/test_release_evidence.py `
+            tests/test_mod_manager.py `
+            -q
+
+      - name: Build the Windows executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller cdumm.spec --clean --noconfirm
+          if (-not (Test-Path -LiteralPath "dist/CDUMM.exe" -PathType Leaf)) {
+            throw "PyInstaller did not produce dist/CDUMM.exe"
+          }
+
+      - name: Probe the packaged protocol surface
+        shell: pwsh
+        run: |
+          python scripts/probe_packaged_protocol.py `
+            --executable "dist/CDUMM.exe"
+
+      - name: Produce source, patch, and CycloneDX evidence
+        shell: pwsh
+        run: |
+          git archive `
+            --format=zip `
+            --prefix="CDUMM-$env:GITHUB_REF_NAME/" `
+            --output="dist/cdumm-source.zip" `
+            "$env:SOURCE_COMMIT"
+          git diff `
+            --binary `
+            "$env:UPSTREAM_BASE_COMMIT" `
+            "$env:SOURCE_COMMIT" |
+            Out-File `
+              -LiteralPath "dist/cdumm-upstream.patch" `
+              -Encoding utf8NoBOM
+          cyclonedx-py environment `
+            --output-format JSON `
+            --output-reproducible `
+            --output-file "dist/cdumm-sbom.cdx.json"
+          python scripts/enrich_release_sbom.py `
+            --input "dist/cdumm-sbom.cdx.json" `
+            --repository-root .
+
+      - name: Record dependency, Defender, and Authenticode results
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          & pip-audit `
+            --format json `
+            --output "dist/pip-audit.json" `
+            --progress-spinner off
+          $pipAuditExitCode = $LASTEXITCODE
+          if (-not (Test-Path -LiteralPath "dist/pip-audit.json")) {
+            [ordered]@{
+              error = "pip-audit did not produce a report"
+              exit_code = $pipAuditExitCode
+            } |
+              ConvertTo-Json |
+              Set-Content `
+                -LiteralPath "dist/pip-audit.json" `
+                -Encoding utf8NoBOM
+          }
+
+          $defenderPath = Join-Path `
+            $env:ProgramFiles `
+            "Windows Defender/MpCmdRun.exe"
+          function Get-SecurityRecord {
+            param([Parameter(Mandatory = $true)][string]$LiteralPath)
+            $item = Get-Item -LiteralPath $LiteralPath
+            $signature = Get-AuthenticodeSignature -LiteralPath $LiteralPath
+            $defenderStatus = "unavailable"
+            $defenderExitCode = $null
+            if (Test-Path -LiteralPath $defenderPath -PathType Leaf) {
+              $defenderOutput = & $defenderPath `
+                -Scan `
+                -ScanType 3 `
+                -File $item.FullName `
+                -DisableRemediation 2>&1
+              $defenderExitCode = $LASTEXITCODE
+              $defenderOutput | ForEach-Object {
+                Write-Host $_
+              }
+              if ($defenderExitCode -eq 0) {
+                $defenderStatus = "clean"
+              } else {
+                $defenderStatus = "scan-error-or-detection"
+              }
+            }
+            return [ordered]@{
+              name = $item.Name
+              size_bytes = $item.Length
+              sha256 = (
+                Get-FileHash -Algorithm SHA256 -LiteralPath $LiteralPath
+              ).Hash.ToLowerInvariant()
+              authenticode = [ordered]@{
+                status = $signature.Status.ToString()
+                signer_subject = if ($signature.SignerCertificate) {
+                  $signature.SignerCertificate.Subject
+                } else {
+                  $null
+                }
+                signer_thumbprint = if ($signature.SignerCertificate) {
+                  $signature.SignerCertificate.Thumbprint
+                } else {
+                  $null
+                }
+              }
+              defender = [ordered]@{
+                status = $defenderStatus
+                exit_code = $defenderExitCode
+              }
+            }
+          }
+
+          $securityReport = [ordered]@{
+            schema = "sublate.cdumm.security-report.v1"
+            disposition = (
+              "findings-recorded-no-clean-claim; exact digest and " +
+              "attestation verification required"
+            )
+            known_provenance_gaps = @(
+              (
+                "crimson_rs.pyd exact source commit and source-to-binary " +
+                "build mapping are unknown"
+              )
+            )
+            pip_audit = [ordered]@{
+              exit_code = $pipAuditExitCode
+              report = "pip-audit.json"
+            }
+            binaries = @(
+              Get-SecurityRecord "dist/CDUMM.exe"
+              Get-SecurityRecord `
+                "src/cdumm/_vendor/crimson_rs/crimson_rs.pyd"
+              Get-SecurityRecord "asi_loader/winmm.dll"
+            )
+          }
+          $securityReport |
+            ConvertTo-Json -Depth 8 |
+            Set-Content `
+              -LiteralPath "dist/cdumm-security-report.json" `
+              -Encoding utf8NoBOM
+
+      - name: Write path-free build manifest
+        shell: pwsh
+        run: |
+          function Get-ArtifactRecord {
+            param([Parameter(Mandatory = $true)][string]$LiteralPath)
+            $item = Get-Item -LiteralPath $LiteralPath
+            return [ordered]@{
+              name = $item.Name
+              size_bytes = $item.Length
+              sha256 = (
+                Get-FileHash -Algorithm SHA256 -LiteralPath $LiteralPath
+              ).Hash.ToLowerInvariant()
+            }
+          }
+
+          $sourceTree = (
+            git rev-parse "$env:SOURCE_COMMIT`^{tree}"
+          ).Trim()
+          $pythonVersion = (
+            python --version
+          ).Trim()
+          $pyinstallerVersion = (
+            python -m PyInstaller --version
+          ).Trim()
+          $manifest = [ordered]@{
+            schema = "sublate.cdumm.build-manifest.v1"
+            protocol = "sublate.cdumm.v1"
+            release = [ordered]@{
+              tag = $env:GITHUB_REF_NAME
+              commit = $env:SOURCE_COMMIT
+              source_tree = $sourceTree
+              upstream_base_commit = $env:UPSTREAM_BASE_COMMIT
+            }
+            build = [ordered]@{
+              os = $env:ImageOS
+              image_version = $env:ImageVersion
+              architecture = $env:PROCESSOR_ARCHITECTURE
+              python = $pythonVersion
+              pyinstaller = $pyinstallerVersion
+            }
+            inputs = @(
+              Get-ArtifactRecord "requirements-release.lock"
+              Get-ArtifactRecord "cdumm.spec"
+            )
+            artifacts = @(
+              Get-ArtifactRecord "dist/CDUMM.exe"
+              Get-ArtifactRecord "dist/cdumm-source.zip"
+              Get-ArtifactRecord "dist/cdumm-upstream.patch"
+              Get-ArtifactRecord "dist/cdumm-sbom.cdx.json"
+              Get-ArtifactRecord "dist/pip-audit.json"
+              Get-ArtifactRecord "dist/cdumm-security-report.json"
+            )
+          }
+          $manifest |
+            ConvertTo-Json -Depth 8 |
+            Set-Content `
+              -LiteralPath "dist/cdumm-build-manifest.json" `
+              -Encoding utf8NoBOM
+
+      - name: Attest executable SBOM relationship
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-path: dist/CDUMM.exe
+          sbom-path: dist/cdumm-sbom.cdx.json
+
+      - name: Attest release build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.1.0
+        with:
+          subject-path: |
+            dist/CDUMM.exe
+            dist/cdumm-source.zip
+            dist/cdumm-upstream.patch
+            dist/cdumm-sbom.cdx.json
+            dist/pip-audit.json
+            dist/cdumm-security-report.json
+            dist/cdumm-build-manifest.json
+
+      - name: Preserve exact workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ github.ref_name }}-windows-x86_64
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            dist/CDUMM.exe
+            dist/cdumm-source.zip
+            dist/cdumm-upstream.patch
+            dist/cdumm-sbom.cdx.json
+            dist/pip-audit.json
+            dist/cdumm-security-report.json
+            dist/cdumm-build-manifest.json
+
+      - name: Publish digest-addressed tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" `
+            --repo "$env:GITHUB_REPOSITORY" `
+            --verify-tag `
+            --title "CDUMM 3.6.0+sub432.1 - Sublate protocol" `
+            --notes (
+              "Provenance-pinned Windows x86_64 CDUMM build for " +
+              "the sublate.cdumm.v1 list/remove lifecycle. " +
+              "Verify CDUMM.exe with the GitHub artifact attestation " +
+              "before use."
+            ) `
+            "dist/CDUMM.exe" `
+            "dist/cdumm-source.zip" `
+            "dist/cdumm-upstream.patch" `
+            "dist/cdumm-sbom.cdx.json" `
+            "dist/pip-audit.json" `
+            "dist/cdumm-security-report.json" `
+            "dist/cdumm-build-manifest.json"

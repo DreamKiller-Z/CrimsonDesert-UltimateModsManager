@@ -10,14 +10,17 @@ Commands:
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
+from cdumm import __version__
 from cdumm.engine.cdmods_paths import get_cdmods_root
 from cdumm.platform import IS_WINDOWS, app_data_dir
 
 APP_DATA_DIR = app_data_dir()
+SUBLATE_PROTOCOL_ID = "sublate.cdumm.v1"
 
 
 class _ExistingDatabase:
@@ -125,15 +128,62 @@ def _cdmods_root(game_dir: Path, db=None) -> Path:
 def _attach_console():
     """Attach to parent console for windowed exe (console=False in PyInstaller).
 
-    Windows-only: the macOS / Linux builds run from a real terminal so
-    stdout/stderr are already wired correctly.
+    A protocol host such as Sublate starts the GUI-subsystem executable with
+    stdout and stderr pipes.  Those inherited Windows handles must remain the
+    destination for machine-readable JSON; replacing them with ``CONOUT$``
+    would make ``subprocess``/``Command::output`` observe an empty response.
+    Interactive launches without redirected handles still attach to the parent
+    console.  macOS and Linux builds already have normal Python streams.
     """
     if IS_WINDOWS:
         import ctypes
+        import msvcrt
+
         kernel32 = ctypes.windll.kernel32
-        if kernel32.AttachConsole(-1):  # ATTACH_PARENT_PROCESS
-            sys.stdout = open("CONOUT$", "w")
-            sys.stderr = open("CONOUT$", "w")
+        kernel32.GetStdHandle.argtypes = [ctypes.c_ulong]
+        kernel32.GetStdHandle.restype = ctypes.c_void_p
+        kernel32.GetFileType.argtypes = [ctypes.c_void_p]
+        kernel32.GetFileType.restype = ctypes.c_ulong
+
+        def redirected_stream(std_handle: int):
+            """Bind an inherited pipe/file handle as a UTF-8 text stream."""
+            handle = kernel32.GetStdHandle(std_handle)
+            invalid_handle = ctypes.c_void_p(-1).value
+            if handle in (None, 0, invalid_handle):
+                return None
+            # FILE_TYPE_DISK=1 and FILE_TYPE_PIPE=3 are redirected targets;
+            # FILE_TYPE_CHAR=2 is a console and is handled below.
+            if kernel32.GetFileType(handle) not in (1, 3):
+                return None
+            descriptor = msvcrt.open_osfhandle(handle, os.O_WRONLY)
+            return open(
+                descriptor,
+                "w",
+                encoding="utf-8",
+                errors="replace",
+                buffering=1,
+                closefd=False,
+            )
+
+        redirected_stdout = redirected_stream(
+            ctypes.c_ulong(-11).value  # STD_OUTPUT_HANDLE
+        )
+        redirected_stderr = redirected_stream(
+            ctypes.c_ulong(-12).value  # STD_ERROR_HANDLE
+        )
+        if redirected_stdout is not None:
+            sys.stdout = redirected_stdout
+        if redirected_stderr is not None:
+            sys.stderr = redirected_stderr
+
+        needs_console = (
+            redirected_stdout is None or redirected_stderr is None
+        )
+        if needs_console and kernel32.AttachConsole(-1):
+            if redirected_stdout is None:
+                sys.stdout = open("CONOUT$", "w")
+            if redirected_stderr is None:
+                sys.stderr = open("CONOUT$", "w")
 
 
 def _setup_logging():
@@ -289,9 +339,8 @@ def cmd_remove_mod(args):
 
     if row is None:
         print(_protocol_json({
-            "action": "already_absent",
-            "mod_id": args.mod_id,
-            "ok": True,
+            "id": args.mod_id,
+            "outcome": "already_absent",
         }))
         return
     if bool(row[1]):
@@ -321,9 +370,8 @@ def cmd_remove_mod(args):
         if db is not None:
             db.connection.rollback()
         print(_protocol_json({
-            "action": "already_absent",
-            "mod_id": args.mod_id,
-            "ok": True,
+            "id": args.mod_id,
+            "outcome": "already_absent",
         }))
         return
     except ModMustBeDisabledError:
@@ -347,10 +395,8 @@ def cmd_remove_mod(args):
             db.close()
 
     print(_protocol_json({
-        "action": "removed",
-        "mod_id": args.mod_id,
-        "name": row[0],
-        "ok": True,
+        "id": args.mod_id,
+        "outcome": "removed",
     }))
 
 
@@ -757,6 +803,11 @@ def main():
     parser = argparse.ArgumentParser(
         prog="cdumm",
         description="CDUMM command-line interface for external tool integration.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"CDUMM {__version__} ({SUBLATE_PROTOCOL_ID})",
     )
     sub = parser.add_subparsers(dest="command")
 

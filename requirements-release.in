@@ -1,0 +1,9 @@
+# Resolve CDUMM's runtime and test/build dependencies from pyproject.toml.
+.[dev]
+
+# Generate a CycloneDX environment SBOM beside every supported executable.
+cyclonedx-bom==7.3.1
+
+# Capture dependency vulnerability findings without silently treating an
+# unknown scan as clean.
+pip-audit==2.10.1

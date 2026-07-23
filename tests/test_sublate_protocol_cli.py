@@ -217,6 +217,23 @@ def test_remove_help_and_main_entrypoint_allowlist(
     assert '"remove-mod"' in main_source
 
 
+def test_version_identifies_exact_fork_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The packaged probe exposes both fork version and protocol identity."""
+    from cdumm import cli
+
+    monkeypatch.setattr(cli, "_attach_console", lambda: None)
+    monkeypatch.setattr(sys, "argv", ["cdumm", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == (
+        "CDUMM 3.6.0+sub432.1 (sublate.cdumm.v1)"
+    )
+
+
 def test_invalid_remove_id_is_nonzero_and_has_zero_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -260,7 +277,9 @@ def test_enabled_remove_is_nonzero_path_free_and_has_zero_side_effects(
         cli.cmd_remove_mod(_remove_args(game_dir, 3))
 
     assert exc.value.code == 4
-    output = json.loads(capsys.readouterr().err)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    output = json.loads(captured.err)
     assert output["error"]["code"] == "mod_enabled"
     assert str(tmp_path) not in json.dumps(output)
     assert _tree_snapshot(game_dir) == before
@@ -301,10 +320,8 @@ def test_disabled_remove_uses_domain_operation_and_preserves_unrelated_state(
 
     result = json.loads(capsys.readouterr().out)
     assert result == {
-        "action": "removed",
-        "mod_id": 1,
-        "name": "Disabled target",
-        "ok": True,
+        "id": 1,
+        "outcome": "removed",
     }
     assert calls == [(1, True, True)]
     assert _fetch_mod_rows(cdmods_dir / "cdumm.db") == [
@@ -336,9 +353,8 @@ def test_missing_remove_is_idempotent_success_with_zero_side_effects(
 
     result = json.loads(capsys.readouterr().out)
     assert result == {
-        "action": "already_absent",
-        "mod_id": 1,
-        "ok": True,
+        "id": 1,
+        "outcome": "already_absent",
     }
     assert _tree_snapshot(game_dir) == before_retry
 
@@ -379,7 +395,7 @@ def test_filesystem_crash_leaves_retryable_row_then_retry_converges(
     monkeypatch.setattr(mod_manager.shutil, "rmtree", original_rmtree)
     cli.cmd_remove_mod(_remove_args(game_dir, 1))
     success = json.loads(capsys.readouterr().out)
-    assert success["action"] == "removed"
+    assert success == {"id": 1, "outcome": "removed"}
     assert [row[0] for row in _fetch_mod_rows(
         cdmods_dir / "cdumm.db"
     )] == [2, 3]
