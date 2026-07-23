@@ -112,7 +112,8 @@ jobs:
             --output-file "dist/cdumm-sbom.cdx.json"
           python scripts/enrich_release_sbom.py `
             --input "dist/cdumm-sbom.cdx.json" `
-            --repository-root .
+            --repository-root . `
+            --source-commit "$env:SOURCE_COMMIT"
 
       - name: Verify source archive bytes against the Git tree
         shell: pwsh

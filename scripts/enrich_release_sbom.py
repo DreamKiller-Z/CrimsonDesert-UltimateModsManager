@@ -4,8 +4,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+
+ATTEST_SBOM_ACTION_COMMIT = "4651f806c01d8637787e274ac3bdf724ef169f34"
+SBOM_SERIAL_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL,
+    (
+        "https://github.com/DreamKiller-Z/"
+        "CrimsonDesert-UltimateModsManager#sublate.cdumm.v1"
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -112,15 +123,61 @@ VENDORED_COMPONENTS = (
 )
 
 
-def enrich_sbom(sbom_path: Path, repository_root: Path) -> None:
-    """Append vendored components and rewrite the SBOM deterministically."""
+def serial_number_for_source(source_commit: str) -> str:
+    """Derive one valid deterministic CycloneDX UUID from a Git commit.
+
+    The release commit covers the dependency lock, build specification,
+    protocol implementation, and vendored binary hashes. UUIDv5 converts that
+    immutable identity into the ``urn:uuid:`` form required by CycloneDX while
+    producing the same serial across dry-run and tag builds of the same source.
+    """
+
+    if len(source_commit) not in {40, 64} or any(
+        character not in "0123456789abcdef" for character in source_commit
+    ):
+        raise ValueError("source commit must be lowercase hexadecimal")
+    serial = uuid.uuid5(
+        SBOM_SERIAL_NAMESPACE,
+        f"sublate.cdumm.v1:git-commit:{source_commit}",
+    )
+    return f"urn:uuid:{serial}"
+
+
+def validate_attest_sbom_compatibility(document: dict) -> None:
+    """Enforce the exact CycloneDX discriminator used by the pinned action.
+
+    ``actions/attest-sbom`` at ``ATTEST_SBOM_ACTION_COMMIT`` accepts CycloneDX
+    only when ``bomFormat``, ``serialNumber``, and ``specVersion`` are truthy.
+    Keeping that parser contract here makes a missing reproducible-generator
+    field a release-blocking error before the attestation step is reached.
+    """
+
+    if not (
+        document.get("bomFormat")
+        and document.get("serialNumber")
+        and document.get("specVersion")
+    ):
+        raise ValueError(
+            "SBOM is incompatible with the pinned attest-sbom CycloneDX parser"
+        )
+
+
+def enrich_sbom(
+    sbom_path: Path,
+    repository_root: Path,
+    source_commit: str,
+) -> None:
+    """Add serial/provenance data and rewrite the SBOM deterministically."""
+
     document = json.loads(sbom_path.read_text(encoding="utf-8"))
+    document["serialNumber"] = serial_number_for_source(source_commit)
     components = document.setdefault("components", [])
     components.extend(
         component.to_cyclonedx(repository_root)
         for component in VENDORED_COMPONENTS
     )
     components.sort(key=lambda component: component.get("bom-ref", ""))
+    validate_attest_sbom_compatibility(document)
     sbom_path.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -132,8 +189,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--repository-root", type=Path, required=True)
+    parser.add_argument("--source-commit", required=True)
     args = parser.parse_args()
-    enrich_sbom(args.input, args.repository_root)
+    enrich_sbom(args.input, args.repository_root, args.source_commit)
 
 
 if __name__ == "__main__":

@@ -3,9 +3,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from pathlib import Path
 
-from scripts.enrich_release_sbom import VENDORED_COMPONENTS, enrich_sbom
+from scripts.enrich_release_sbom import (
+    ATTEST_SBOM_ACTION_COMMIT,
+    VENDORED_COMPONENTS,
+    enrich_sbom,
+    serial_number_for_source,
+    validate_attest_sbom_compatibility,
+)
+
+
+FIXTURE_SOURCE_COMMIT = "1234567890abcdef1234567890abcdef12345678"
 
 
 def test_vendored_component_hashes_and_provenance_are_explicit() -> None:
@@ -39,11 +49,15 @@ def test_enrichment_is_path_free_and_includes_both_binary_components(
     repository_root = Path(__file__).parents[1]
     sbom_path = tmp_path / "sbom.json"
     sbom_path.write_text(
-        json.dumps({"bomFormat": "CycloneDX", "components": []}),
+        json.dumps({
+            "bomFormat": "CycloneDX",
+            "components": [],
+            "specVersion": "1.6",
+        }),
         encoding="utf-8",
     )
 
-    enrich_sbom(sbom_path, repository_root)
+    enrich_sbom(sbom_path, repository_root, FIXTURE_SOURCE_COMMIT)
 
     rendered = sbom_path.read_text(encoding="utf-8")
     document = json.loads(rendered)
@@ -51,3 +65,50 @@ def test_enrichment_is_path_free_and_includes_both_binary_components(
     assert "crimson_rs.pyd" in names
     assert "Ultimate ASI Loader x64 (renamed winmm.dll)" in names
     assert str(repository_root) not in rendered
+
+
+def test_sbom_serial_is_deterministic_valid_and_source_derived() -> None:
+    """UUIDv5 serials are stable per commit and distinct across source commits."""
+
+    serial = serial_number_for_source(FIXTURE_SOURCE_COMMIT)
+    repeated = serial_number_for_source(FIXTURE_SOURCE_COMMIT)
+    different = serial_number_for_source("a" * 40)
+
+    assert serial == repeated
+    assert serial != different
+    assert serial.startswith("urn:uuid:")
+    parsed = uuid.UUID(serial.removeprefix("urn:uuid:"))
+    assert parsed.version == 5
+    assert str(parsed) == serial.removeprefix("urn:uuid:")
+
+
+def test_enriched_sbom_matches_exact_pinned_attest_parser(tmp_path: Path) -> None:
+    """Generated evidence satisfies the parser at the workflow's exact pin."""
+
+    repository_root = Path(__file__).parents[1]
+    workflow = (
+        repository_root / ".github/workflows/sublate-protocol-release.yml"
+    ).read_text(encoding="utf-8")
+    assert f"actions/attest-sbom@{ATTEST_SBOM_ACTION_COMMIT}" in workflow
+
+    sbom_path = tmp_path / "sbom.json"
+    sbom_path.write_text(
+        json.dumps({
+            "bomFormat": "CycloneDX",
+            "components": [],
+            "specVersion": "1.6",
+        }),
+        encoding="utf-8",
+    )
+    enrich_sbom(sbom_path, repository_root, FIXTURE_SOURCE_COMMIT)
+    document = json.loads(sbom_path.read_text(encoding="utf-8"))
+
+    # This is the exact truthy-field discriminator in
+    # actions/attest-sbom/src/sbom.ts::checkIsCycloneDX at the pinned commit.
+    pinned_parser_accepts = bool(
+        document.get("bomFormat")
+        and document.get("serialNumber")
+        and document.get("specVersion")
+    )
+    assert pinned_parser_accepts
+    validate_attest_sbom_compatibility(document)
